@@ -11,10 +11,9 @@ class SpeechToTextService {
     this.credentials = null;
     // Note: Client initialization is deferred to getSpeechClient() for faster startup
     
-    // Dual-stream overlap management
-    this.overlappingStreams = new Map(); // socketId -> { oldStream, transitionStartTime }
-    this.OVERLAP_DURATION = 5000; // 5 seconds of overlap
-    this.PRE_RESTART_BUFFER = 5000; // Start new stream 5 seconds before limit
+    // Standby stream management (clean handoff approach)
+    this.standbyStreams = new Map(); // socketId -> { stream, callbacks, createdAt }
+    this.PRE_RESTART_BUFFER = 10000; // Create standby stream 10 seconds before limit
   }
 
   async initializeCredentials() {
@@ -187,22 +186,20 @@ class SpeechToTextService {
       throw new Error(`Failed to create recognition stream: ${error.message}`);
     }
 
-    // Start restart 5 seconds early to allow for overlap transition
-    const STREAM_DURATION_LIMIT = (4.5 * 60 * 1000) - this.PRE_RESTART_BUFFER; // 4:25 to allow 5s overlap buffer
+    // Start standby stream creation 1 minute before limit (at 4 minutes)
+    const STREAM_DURATION_LIMIT = (0.5 * 60 * 1000); // 0.5 minutes - create standby at this point
 
-    // Set up automatic restart timer - attach to stream so it can be cleared
-    const restartTimer = setTimeout(() => {
-      console.log('🔄 Google Cloud stream approaching 5-minute limit, initiating overlap transition...');
-      if (callbacks && callbacks.onPreRestart) {
-        // Signal that pre-emptive restart is starting (for overlap)
+    // Set up automatic standby creation timer - attach to stream so it can be cleared
+    const standbyTimer = setTimeout(() => {
+      console.log('🔄 Google Cloud stream approaching 5-minute limit, creating standby stream...');
+      if (callbacks && callbacks.onPreRestart && typeof callbacks.onPreRestart === 'function') {
+        // Signal that standby stream should be created
         callbacks.onPreRestart();
-      } else if (callbacks && callbacks.onRestart) {
-        callbacks.onRestart();
       }
     }, STREAM_DURATION_LIMIT);
     
-    // Attach timer to stream so server.js can clear it during overlap
-    recognizeStream._restartTimer = restartTimer;
+    // Attach timer to stream so server.js can clear it
+    recognizeStream._standbyTimer = standbyTimer;
 
     // Handle streaming responses
     recognizeStream.on('data', (response) => {
@@ -231,7 +228,7 @@ class SpeechToTextService {
         details: error.details,
         metadata: error.metadata
       });
-      clearTimeout(restartTimer);
+      clearTimeout(standbyTimer);
       // Mark stream as destroyed on error
       if (recognizeStream) {
         recognizeStream.destroyed = true;
@@ -265,14 +262,14 @@ class SpeechToTextService {
     });
 
     recognizeStream.on('end', () => {
-      clearTimeout(restartTimer);
+      clearTimeout(standbyTimer);
       if (callbacks && callbacks.onEnd) {
         callbacks.onEnd();
       }
     });
 
-    // Store restart timer for cleanup
-    recognizeStream._restartTimer = restartTimer;
+    // Store standby timer for cleanup
+    recognizeStream._standbyTimer = standbyTimer;
 
     return recognizeStream;
   }
@@ -315,73 +312,78 @@ class SpeechToTextService {
   }
 
   /**
-   * Start a pre-emptive stream transition with overlap
-   * This creates a new stream while keeping the old one active for a brief overlap period
+   * Create a standby stream that will be activated when current transcription is finalized
+   * This stream is created but does not receive audio until activated
    */
-  async startOverlapTransition(socketId, oldStream, languageCode, speechEndTimeout, callbacks) {
-    console.log(`🔄 [OVERLAP] Starting pre-emptive stream transition for ${socketId}`);
+  async createStandbyStream(socketId, languageCode, speechEndTimeout, callbacks) {
+    console.log(`🔄 [STANDBY] Creating standby stream for ${socketId}`);
     
-    // Store the old stream in overlap map
-    this.overlappingStreams.set(socketId, {
-      oldStream: oldStream,
-      transitionStartTime: Date.now()
-    });
-    
-    // Remove error listener from old stream to prevent interference
-    if (oldStream) {
-      oldStream.removeAllListeners('error');
-      oldStream.on('error', (error) => {
-        console.log(`⚠️ [OVERLAP] Old stream error (expected during transition): ${error.message}`);
+    try {
+      // Create the stream but don't send audio to it yet
+      const standbyStream = await this.startStreamingRecognition(languageCode, speechEndTimeout, callbacks);
+      
+      // Store standby stream info
+      this.standbyStreams.set(socketId, {
+        stream: standbyStream,
+        callbacks: callbacks,
+        createdAt: Date.now(),
+        languageCode: languageCode,
+        speechEndTimeout: speechEndTimeout
       });
-    }
-    
-    // Create new stream
-    const newStream = await this.startStreamingRecognition(languageCode, speechEndTimeout, callbacks);
-    
-    // Schedule the old stream to close after overlap period
-    setTimeout(() => {
-      console.log(`🔄 [OVERLAP] Closing old stream after ${this.OVERLAP_DURATION}ms overlap`);
-      const overlapInfo = this.overlappingStreams.get(socketId);
-      if (overlapInfo && overlapInfo.oldStream) {
-        this.endStreamingRecognition(overlapInfo.oldStream);
-      }
-      this.overlappingStreams.delete(socketId);
-    }, this.OVERLAP_DURATION);
-    
-    return newStream;
-  }
-
-  /**
-   * Send audio to both active and overlapping streams during transition
-   */
-  sendAudioWithOverlap(socketId, activeStream, audioBuffer) {
-    // Send to main stream
-    this.sendAudioToStream(activeStream, audioBuffer);
-    
-    // Also send to overlapping stream if in transition
-    const overlapInfo = this.overlappingStreams.get(socketId);
-    if (overlapInfo && overlapInfo.oldStream && !overlapInfo.oldStream.destroyed) {
-      this.sendAudioToStream(overlapInfo.oldStream, audioBuffer);
+      
+      console.log(`✅ [STANDBY] Standby stream created for ${socketId}`);
+      return standbyStream;
+    } catch (error) {
+      console.error(`❌ [STANDBY] Failed to create standby stream for ${socketId}:`, error);
+      throw error;
     }
   }
 
   /**
-   * Clean up any overlapping streams for a socket
+   * Activate standby stream and switch to it (closing old stream)
+   * This is called when a transcription bubble is finalized
    */
-  cleanupOverlap(socketId) {
-    const overlapInfo = this.overlappingStreams.get(socketId);
-    if (overlapInfo && overlapInfo.oldStream) {
-      this.endStreamingRecognition(overlapInfo.oldStream);
+  activateStandbyStream(socketId, oldStream) {
+    console.log(`🔄 [STANDBY] Activating standby stream for ${socketId}`);
+    
+    const standbyInfo = this.standbyStreams.get(socketId);
+    if (!standbyInfo || !standbyInfo.stream) {
+      console.log(`⚠️ [STANDBY] No standby stream found for ${socketId}`);
+      return null;
     }
-    this.overlappingStreams.delete(socketId);
+    
+    // Close the old stream cleanly
+    if (oldStream && !oldStream.destroyed) {
+      console.log(`🔄 [STANDBY] Closing old stream for ${socketId}`);
+      this.endStreamingRecognition(oldStream);
+    }
+    
+    // Remove standby from map (it's now the active stream)
+    this.standbyStreams.delete(socketId);
+    
+    console.log(`✅ [STANDBY] Standby stream activated for ${socketId}`);
+    return standbyInfo.stream;
   }
 
   /**
-   * Check if a socket is currently in overlap transition
+   * Check if a standby stream exists for a socket
    */
-  isInOverlap(socketId) {
-    return this.overlappingStreams.has(socketId);
+  hasStandbyStream(socketId) {
+    return this.standbyStreams.has(socketId);
   }
+
+  /**
+   * Clean up standby stream if it exists (e.g., on disconnect)
+   */
+  cleanupStandbyStream(socketId) {
+    const standbyInfo = this.standbyStreams.get(socketId);
+    if (standbyInfo && standbyInfo.stream) {
+      console.log(`🧹 [STANDBY] Cleaning up standby stream for ${socketId}`);
+      this.endStreamingRecognition(standbyInfo.stream);
+    }
+    this.standbyStreams.delete(socketId);
+  }
+
 
 }
 

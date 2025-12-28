@@ -804,31 +804,31 @@ io.on('connection', async (socket) => {
                 onEnd: () => {
                   console.log('🎤 Google Cloud streaming ended');
                 },
-                // Pre-emptive restart with overlap (called 5 seconds before limit)
+                // Create standby stream 1 minute before limit (called at 4 minutes)
                 onPreRestart: async () => {
-                  console.log('🔄 Starting pre-emptive stream overlap transition...');
-                  
-                  // Notify the speaker to save any displayed interim text
-                  socket.emit('streamRestartPending', { 
-                    reason: 'approaching-5-minute-limit',
-                    timestamp: Date.now()
-                  });
+                  console.log('🔄 Creating standby stream (1 minute before limit)...');
                   
                   const currentStream = streamingSessions.get(socket.id);
                   if (!currentStream) {
-                    console.log('⚠️ No current stream to transition from');
+                    console.log('⚠️ No current stream to create standby for');
+                    return;
+                  }
+                  
+                  // Check if standby already exists
+                  if (speechToTextService.hasStandbyStream(socket.id)) {
+                    console.log('⚠️ Standby stream already exists, skipping creation');
                     return;
                   }
                   
                   try {
-                    // Use overlap transition - keeps old stream alive for 5 seconds
-                    const newRecognizeStream = await speechToTextService.startOverlapTransition(
+                    // Create standby stream (not receiving audio yet)
+                    await speechToTextService.createStandbyStream(
                       socket.id,
-                      currentStream,
                       sourceLanguage,
                       speechEndTimeout,
                       {
                         onResult: async (result) => {
+                          // This will be used when standby is activated
                           const activeBubbleId = currentBubbleIds.get(socket.id) || bubbleId;
                           socket.emit('transcriptionUpdate', {
                             transcript: result.transcript,
@@ -873,26 +873,25 @@ io.on('connection', async (socket) => {
                           }
                         },
                         onError: (error) => {
-                          console.error('❌ New stream error during overlap:', error);
+                          console.error('❌ Standby stream error:', error);
                         },
                         onEnd: () => {
-                          console.log('🎤 Overlap stream ended');
+                          console.log('🎤 Standby stream ended');
                         },
-                        onPreRestart: arguments.callee,
-                        onRestart: arguments.callee
+                        // Standby streams don't need onPreRestart/onRestart - they become the active stream
+                        // and will get their own callbacks when activated
+                        onPreRestart: null,
+                        onRestart: null
                       }
                     );
                     
-                    if (newRecognizeStream) {
-                      streamingSessions.set(socket.id, newRecognizeStream);
-                      console.log('✅ Stream overlap transition successful');
-                    }
+                    console.log('✅ Standby stream created successfully');
                   } catch (error) {
-                    console.error('❌ Failed to start overlap transition:', error);
+                    console.error('❌ Failed to create standby stream:', error);
                   }
                 },
                 // Fallback restart (for error recovery)
-                onRestart: async () => {
+                onRestart: (async function restartStream() {
                   console.log('🔄 Restarting Google Cloud stream with buffering (fallback)...');
                   
                   // Mark this socket as restarting to buffer incoming audio
@@ -1082,7 +1081,7 @@ io.on('connection', async (socket) => {
                     onEnd: () => {
                       console.log('🎤 Google Cloud streaming ended');
                     },
-                    onRestart: arguments.callee // Recursive restart
+                    onRestart: restartStream // Recursive restart
                   });
                   
                   // Store new stream
@@ -1105,7 +1104,7 @@ io.on('connection', async (socket) => {
                     console.log('✅ Stream restarted successfully');
                   }
                 }
-                });
+                )});
                 
                 // Store the stream for this socket
                 if (recognizeStream) {
@@ -1144,11 +1143,11 @@ io.on('connection', async (socket) => {
               return; // Don't try to send to stream while restarting
             }
             
-            // Send audio chunk to Google Cloud streaming (with overlap support)
+            // Send audio chunk to Google Cloud streaming (only to active stream)
             const recognizeStream = streamingSessions.get(socket.id);
             if (recognizeStream && !recognizeStream.destroyed) {
-              // Use overlap-aware audio sending (sends to both streams during transition)
-              speechToTextService.sendAudioWithOverlap(socket.id, recognizeStream, audioBuffer);
+              // Send audio only to active stream (standby streams don't receive audio until activated)
+              speechToTextService.sendAudioToStream(recognizeStream, audioBuffer);
             } else {
               // Only log error if we're not in a transient state
               if (!restartingStreams.get(socket.id)) {
@@ -1380,8 +1379,8 @@ io.on('connection', async (socket) => {
       typingIndicatorTimeouts.delete(socket.id)
     }
     
-    // Clean up any overlapping streams
-    speechToTextService.cleanupOverlap(socket.id)
+    // Clean up any standby streams
+    speechToTextService.cleanupStandbyStream(socket.id)
     
     // Clean up content hashes
     cleanupContentHashes(socket.id)
@@ -1494,6 +1493,20 @@ async function handleFinalTranscription(socket, transcript, sourceLanguage, acti
   for (const [key, timestamp] of processedTranscripts.entries()) {
     if (timestamp < fiveMinutesAgo) {
       processedTranscripts.delete(key);
+    }
+  }
+  
+  // Check if we have a standby stream and switch to it now that transcription is finalized
+  if (speechToTextService.hasStandbyStream(socket.id)) {
+    console.log('🔄 [STANDBY] Final transcription received, switching to standby stream...');
+    const currentStream = streamingSessions.get(socket.id);
+    const newStream = speechToTextService.activateStandbyStream(socket.id, currentStream);
+    
+    if (newStream) {
+      streamingSessions.set(socket.id, newStream);
+      console.log('✅ [STANDBY] Successfully switched to standby stream');
+    } else {
+      console.error('❌ [STANDBY] Failed to activate standby stream');
     }
   }
   
