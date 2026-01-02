@@ -51,10 +51,9 @@ class SpeechToTextService {
     if (this.client) {
       return this.client;
     }
-
+    
     const credentials = await this.initializeCredentials();
     
-    // Use default credentials if no explicit credentials found
     if (credentials) {
       this.client = new speech.SpeechClient({
         projectId: this.projectId,
@@ -64,7 +63,6 @@ class SpeechToTextService {
         }
       });
     } else {
-      // Use default service account (Cloud Run)
       this.client = new speech.SpeechClient({
         projectId: this.projectId
       });
@@ -148,52 +146,89 @@ class SpeechToTextService {
   }
 
   /**
-   * Start streaming recognition with Google Cloud Speech-to-Text
+   * Get the best model for a given language code
+   * V1 API models: default, phone_call, video, command_and_search, latest_long, latest_short
+   * phone_call is best for conversational speech
+   */
+  getBestModelForLanguage(languageCode) {
+    // V1 API model selection - phone_call is optimized for conversational speech
+    const modelMap = {
+      // English - full enhanced support
+      'en-US': { model: 'telephony', useEnhanced: true },
+      'en-GB': { model: 'telephony', useEnhanced: true },
+      'en-AU': { model: 'telephony', useEnhanced: true },
+      'en-CA': { model: 'telephony', useEnhanced: false },
+      'en-IN': { model: 'telephony', useEnhanced: true },
+      
+      // French - phone_call for conversational
+      'fr-FR': { model: 'telephony', useEnhanced: false },
+      'fr-CA': { model: 'telephony', useEnhanced: false },
+      'fr-BE': { model: 'telephony', useEnhanced: false },
+      'fr-CH': { model: 'telephony', useEnhanced: false },
+      
+      // Spanish
+      'es-ES': { model: 'telephony', useEnhanced: false },
+      'es-MX': { model: 'telephony', useEnhanced: false },
+      'es-US': { model: 'telephony', useEnhanced: false },
+      'es-419': { model: 'telephony', useEnhanced: false },
+      'es-CO': { model: 'telephony', useEnhanced: false },
+      
+      // Other languages
+      'pt-BR': { model: 'telephony', useEnhanced: false },
+      'de-DE': { model: 'telephony', useEnhanced: false },
+      'it-IT': { model: 'telephony', useEnhanced: false },
+      'ja-JP': { model: 'telephony', useEnhanced: false },
+    };
+    
+    if (modelMap[languageCode]) {
+      return modelMap[languageCode];
+    }
+    
+    // Fallback by language prefix
+    const langPrefix = languageCode.split('-')[0];
+    if (['en', 'fr', 'de', 'it', 'ja', 'pt'].includes(langPrefix)) {
+      return { model: 'telephony', useEnhanced: false };
+    }
+    
+    return { model: 'default', useEnhanced: false };
+  }
+
+  /**
+   * Start streaming recognition with Google Cloud Speech-to-Text V1 API
    */
   async startStreamingRecognition(languageCode, speechEndTimeout = 1.0, callbacks) {
     const client = await this.getSpeechClient();
     
-    // Frontend sends proper locale codes (en-US, fr-FR, etc.) - use directly
+    // Verify project ID is set
+    if (!this.projectId) {
+      throw new Error('GOOGLE_CLOUD_PROJECT_ID is not set');
+    }
     
-    // Enhanced configuration for better accuracy and word detection
-    // Try 'latest_long' model first for better accuracy, fallback to 'default' if not supported
-    const request = {
+    // Determine best model based on language
+    const modelInfo = this.getBestModelForLanguage(languageCode);
+    const model = modelInfo.model;
+    const useEnhanced = modelInfo.useEnhanced;
+    
+    console.log(`🔍 [V1 API] Selected model for ${languageCode}: ${model} (enhanced: ${useEnhanced})`);
+    
+    // V1 API streaming configuration
+    const streamingConfig = {
       config: {
         encoding: 'LINEAR16',
-        sampleRateHertz: 48000, // Match frontend sample rate
+        sampleRateHertz: 48000,
         languageCode: languageCode,
+        model: model,
+        useEnhanced: useEnhanced,
         enableAutomaticPunctuation: true,
-        enableWordTimeOffsets: true, // Helps with word boundary detection
-        useEnhanced: true, // Use enhanced model for better accuracy
-        model: 'latest_long', // Use latest long model for better accuracy (supports most languages)
-        // Alternative language codes can help with mixed language scenarios
-        // but may reduce accuracy, so we'll leave it out for now
+        enableWordTimeOffsets: true
       },
-      interimResults: true, // Get interim results for real-time display
-      singleUtterance: false // Allow continuous streaming
+      interimResults: true
     };
-
-    // Create streaming recognition request with fallback for unsupported models
-    let recognizeStream;
-    try {
-      recognizeStream = client.streamingRecognize(request);
-    } catch (error) {
-      // If latest_long model fails, try with default model (better language compatibility)
-      if (error.message && error.message.includes('model')) {
-        console.warn(`⚠️ Enhanced model not supported for ${languageCode}, falling back to default model`);
-        request.config.model = 'default';
-        request.config.useEnhanced = false; // Disable enhanced when using default model
-        try {
-          recognizeStream = client.streamingRecognize(request);
-        } catch (fallbackError) {
-          console.error('❌ Failed to create recognize stream with fallback:', fallbackError);
-          throw new Error(`Failed to create recognition stream: ${fallbackError.message}`);
-        }
-      } else {
-        console.error('❌ Failed to create recognize stream:', error);
-        throw new Error(`Failed to create recognition stream: ${error.message}`);
-      }
-    }
+    
+    // Create the streaming recognition request
+    const recognizeStream = client.streamingRecognize(streamingConfig);
+    
+    console.log(`✅ [V1 API] Stream created with model "${model}" for ${languageCode}`);
 
     // Start standby stream creation 1.5 minutes before limit (at 3.5 minutes)
     const STREAM_DURATION_LIMIT = (3.5 * 60 * 1000); // 3.5 minutes - create standby at this point
@@ -209,21 +244,24 @@ class SpeechToTextService {
     // Attach timer to stream so server.js can clear it
     recognizeStream._standbyTimer = standbyTimer;
 
-    // Handle streaming responses
+    // Handle streaming responses - Works with both V1 and V2 models
     recognizeStream.on('data', (response) => {
       if (response.results && response.results.length > 0) {
         const result = response.results[0];
-        const transcript = result.alternatives[0].transcript;
-        const isFinal = result.isFinal;
-        const confidence = result.alternatives[0].confidence || 0.8;
-        
-        if (callbacks && callbacks.onResult) {
-          callbacks.onResult({
-            transcript: transcript,
-            isFinal: isFinal,
-            confidence: confidence,
-            resultEndTime: result.resultEndTime
-          });
+        if (result.alternatives && result.alternatives.length > 0) {
+          const alternative = result.alternatives[0];
+          const transcript = alternative.transcript;
+          const isFinal = result.isFinal || false;
+          const confidence = alternative.confidence || 0.8;
+          
+          if (callbacks && callbacks.onResult) {
+            callbacks.onResult({
+              transcript: transcript,
+              isFinal: isFinal,
+              confidence: confidence,
+              resultEndTime: result.resultEndTime
+            });
+          }
         }
       }
     });
@@ -283,6 +321,7 @@ class SpeechToTextService {
 
   /**
    * Send audio data to streaming recognition
+   * V1 API: Audio is sent directly as buffer
    */
   sendAudioToStream(recognizeStream, audioBuffer) {
     if (recognizeStream && !recognizeStream.destroyed) {
@@ -291,8 +330,6 @@ class SpeechToTextService {
       } catch (error) {
         console.error('❌ Error writing to stream:', error);
       }
-    } else {
-      console.error('❌ Cannot send audio - stream is null or destroyed');
     }
   }
 
