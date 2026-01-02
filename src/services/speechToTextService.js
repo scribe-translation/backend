@@ -13,7 +13,7 @@ class SpeechToTextService {
     
     // Standby stream management (clean handoff approach)
     this.standbyStreams = new Map(); // socketId -> { stream, callbacks, createdAt }
-    this.PRE_RESTART_BUFFER = 10000; // Create standby stream 10 seconds before limit
+    this.PRE_RESTART_BUFFER = 90000; // Create standby stream 1.5 minutes before limit
   }
 
   async initializeCredentials() {
@@ -26,20 +26,17 @@ class SpeechToTextService {
       
       if (isProduction) {
         // Production: always use service account (ADC)
-        console.log('☁️ Using default service account (production)');
         this.credentials = null;
         return this.credentials;
       }
       
       // Development: try local credentials file
       if (fs.existsSync('./google-credentials.json')) {
-        console.log('🔧 Loading credentials from local file (development)');
         this.credentials = JSON.parse(fs.readFileSync('./google-credentials.json', 'utf8'));
         return this.credentials;
       }
 
       // Fallback to ADC
-      console.log('☁️ Using default service account');
       this.credentials = null;
       return this.credentials;
     } catch (error) {
@@ -81,7 +78,6 @@ class SpeechToTextService {
    */
   async convertWebMToLinear16(webmBuffer) {
     return new Promise((resolve, reject) => {
-      console.log('🔄 Converting WebM to LINEAR16...');
       
       const ffmpeg = spawn('ffmpeg', [
         '-i', 'pipe:0',           // Read from stdin
@@ -105,7 +101,6 @@ class SpeechToTextService {
 
       ffmpeg.on('close', (code) => {
         if (code === 0) {
-          console.log(`✅ Conversion successful: ${webmBuffer.length} bytes → ${outputBuffer.length} bytes`);
           resolve(outputBuffer);
         } else {
           const error = errorBuffer.toString();
@@ -129,7 +124,6 @@ class SpeechToTextService {
    * Test LINEAR16 format with Google Cloud Speech-to-Text
    */
   async testLinear16Format(audioBuffer) {
-    console.log('🧪 Testing LINEAR16 format with Google Cloud Speech-to-Text...');
     
     const client = await this.getSpeechClient();
     
@@ -146,7 +140,6 @@ class SpeechToTextService {
 
     try {
       const [response] = await client.recognize(request);
-      console.log('✅ LINEAR16 format test successful:', response);
       return response;
     } catch (error) {
       console.log('❌ LINEAR16 format test failed:', error.message);
@@ -161,37 +154,52 @@ class SpeechToTextService {
     const client = await this.getSpeechClient();
     
     // Frontend sends proper locale codes (en-US, fr-FR, etc.) - use directly
-    console.log(`🎤 Starting Google Speech recognition with language: ${languageCode}, speechEndTimeout: ${speechEndTimeout}s`);
     
-    // Models with broad language support - 'latest_long' doesn't support all locales
-    // Use 'default' for maximum language compatibility
+    // Enhanced configuration for better accuracy and word detection
+    // Try 'latest_long' model first for better accuracy, fallback to 'default' if not supported
     const request = {
       config: {
         encoding: 'LINEAR16',
         sampleRateHertz: 48000, // Match frontend sample rate
         languageCode: languageCode,
         enableAutomaticPunctuation: true,
+        enableWordTimeOffsets: true, // Helps with word boundary detection
+        useEnhanced: true, // Use enhanced model for better accuracy
+        model: 'latest_long', // Use latest long model for better accuracy (supports most languages)
+        // Alternative language codes can help with mixed language scenarios
+        // but may reduce accuracy, so we'll leave it out for now
       },
       interimResults: true, // Get interim results for real-time display
       singleUtterance: false // Allow continuous streaming
     };
 
-    // Create streaming recognition request
+    // Create streaming recognition request with fallback for unsupported models
     let recognizeStream;
     try {
       recognizeStream = client.streamingRecognize(request);
-      console.log('✅ Stream created successfully');
     } catch (error) {
-      console.error('❌ Failed to create recognize stream:', error);
-      throw new Error(`Failed to create recognition stream: ${error.message}`);
+      // If latest_long model fails, try with default model (better language compatibility)
+      if (error.message && error.message.includes('model')) {
+        console.warn(`⚠️ Enhanced model not supported for ${languageCode}, falling back to default model`);
+        request.config.model = 'default';
+        request.config.useEnhanced = false; // Disable enhanced when using default model
+        try {
+          recognizeStream = client.streamingRecognize(request);
+        } catch (fallbackError) {
+          console.error('❌ Failed to create recognize stream with fallback:', fallbackError);
+          throw new Error(`Failed to create recognition stream: ${fallbackError.message}`);
+        }
+      } else {
+        console.error('❌ Failed to create recognize stream:', error);
+        throw new Error(`Failed to create recognition stream: ${error.message}`);
+      }
     }
 
-    // Start standby stream creation 1 minute before limit (at 4 minutes)
-    const STREAM_DURATION_LIMIT = (0.5 * 60 * 1000); // 0.5 minutes - create standby at this point
+    // Start standby stream creation 1.5 minutes before limit (at 3.5 minutes)
+    const STREAM_DURATION_LIMIT = (3.5 * 60 * 1000); // 3.5 minutes - create standby at this point
 
     // Set up automatic standby creation timer - attach to stream so it can be cleared
     const standbyTimer = setTimeout(() => {
-      console.log('🔄 Google Cloud stream approaching 5-minute limit, creating standby stream...');
       if (callbacks && callbacks.onPreRestart && typeof callbacks.onPreRestart === 'function') {
         // Signal that standby stream should be created
         callbacks.onPreRestart();
@@ -251,7 +259,6 @@ class SpeechToTextService {
                            ));
       
       if (isRecoverable && callbacks && callbacks.onRestart) {
-        console.log('🔄 Recoverable error detected, triggering automatic stream restart...');
         // Delay restart slightly to avoid rapid reconnection
         setTimeout(() => {
           callbacks.onRestart();
@@ -316,7 +323,6 @@ class SpeechToTextService {
    * This stream is created but does not receive audio until activated
    */
   async createStandbyStream(socketId, languageCode, speechEndTimeout, callbacks) {
-    console.log(`🔄 [STANDBY] Creating standby stream for ${socketId}`);
     
     try {
       // Create the stream but don't send audio to it yet
@@ -331,7 +337,6 @@ class SpeechToTextService {
         speechEndTimeout: speechEndTimeout
       });
       
-      console.log(`✅ [STANDBY] Standby stream created for ${socketId}`);
       return standbyStream;
     } catch (error) {
       console.error(`❌ [STANDBY] Failed to create standby stream for ${socketId}:`, error);
@@ -344,7 +349,6 @@ class SpeechToTextService {
    * This is called when a transcription bubble is finalized
    */
   activateStandbyStream(socketId, oldStream) {
-    console.log(`🔄 [STANDBY] Activating standby stream for ${socketId}`);
     
     const standbyInfo = this.standbyStreams.get(socketId);
     if (!standbyInfo || !standbyInfo.stream) {
@@ -354,14 +358,12 @@ class SpeechToTextService {
     
     // Close the old stream cleanly
     if (oldStream && !oldStream.destroyed) {
-      console.log(`🔄 [STANDBY] Closing old stream for ${socketId}`);
       this.endStreamingRecognition(oldStream);
     }
     
     // Remove standby from map (it's now the active stream)
     this.standbyStreams.delete(socketId);
     
-    console.log(`✅ [STANDBY] Standby stream activated for ${socketId}`);
     return standbyInfo.stream;
   }
 
@@ -378,7 +380,6 @@ class SpeechToTextService {
   cleanupStandbyStream(socketId) {
     const standbyInfo = this.standbyStreams.get(socketId);
     if (standbyInfo && standbyInfo.stream) {
-      console.log(`🧹 [STANDBY] Cleaning up standby stream for ${socketId}`);
       this.endStreamingRecognition(standbyInfo.stream);
     }
     this.standbyStreams.delete(socketId);

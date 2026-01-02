@@ -5,11 +5,13 @@
   "main": "src/server.js",
   "scripts": {
     "start": "NODE_ENV=prod node server.js",
-    "dev": "concurrently --kill-others \"npm run emulator\" \"sleep 5 && npm run dev:server\"",
+    "dev": "concurrently --kill-others --handle-input --raw --default-input-target 0 \"npm run emulator\" \"sleep 5 && npm run dev:server\"",
+    "dev:script": "bash dev.sh",
     "dev:server": "FIRESTORE_EMULATOR_HOST=localhost:8181 NODE_ENV=dev nodemon server.js",
-    "emulator": "npx firebase emulators:start --only firestore --project demo-scribe --import=./emulator-data --export-on-exit=./emulator-data",
+    "emulator": "firebase emulators:start --only firestore --project demo-scribe --import=./emulator-data --export-on-exit=./emulator-data",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "kill": "pkill -f 'node'"
+    "kill": "bash shutdown.sh",
+    "cleanup": "pkill -f 'firebase.*emulators' || true"
   },
   "keywords": [
     "translation",
