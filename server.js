@@ -1523,13 +1523,15 @@ async function handleFinalTranscription(socket, transcript, sourceLanguage, acti
   
   // Check if we have a standby stream and switch to it now that transcription is finalized
   if (speechToTextService.hasStandbyStream(socket.id)) {
+    console.log(`🔄 [HANDOFF] Final transcription received, switching to standby stream for ${socket.id}`);
     const currentStream = streamingSessions.get(socket.id);
     const newStream = speechToTextService.activateStandbyStream(socket.id, currentStream);
     
     if (newStream) {
       streamingSessions.set(socket.id, newStream);
+      console.log(`✅ [HANDOFF] Successfully switched to standby stream for ${socket.id}`);
     } else {
-      console.error('❌ [STANDBY] Failed to activate standby stream');
+      console.error('❌ [HANDOFF] Failed to activate standby stream');
     }
   }
   
