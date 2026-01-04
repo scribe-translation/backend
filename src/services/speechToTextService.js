@@ -230,22 +230,73 @@ class SpeechToTextService {
     
     console.log(`✅ [V1 API] Stream created with model "${model}" for ${languageCode}`);
 
-    // Start standby stream creation 1.5 minutes before limit (at 3.5 minutes)
-    const STREAM_DURATION_LIMIT = (3.5 * 60 * 1000); // 3.5 minutes - create standby at this point
+    // Stream health tracking
+    const streamHealth = {
+      lastDataTime: Date.now(),
+      lastAudioTime: Date.now(),
+      createdAt: Date.now()
+    };
+    recognizeStream._health = streamHealth;
 
-    // Set up automatic standby creation timer - attach to stream so it can be cleared
+    // Google Cloud streaming limit is ~5 minutes (305 seconds)
+    // Pre-restart: Create standby at 3.5 minutes
+    const STANDBY_CREATION_TIME = (3.5 * 60 * 1000); // 3.5 minutes
+    // Hard restart: Force restart at 4.5 minutes to ensure we don't hit the limit
+    const HARD_RESTART_TIME = (4.5 * 60 * 1000); // 4.5 minutes
+    // Health check: If no data received for 30 seconds while audio is being sent, restart
+    const HEALTH_CHECK_INTERVAL = 10000; // Check every 10 seconds
+    const DATA_TIMEOUT = 30000; // 30 seconds without data = problem
+
+    // Set up automatic standby creation timer
     const standbyTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Standby timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
       if (callbacks && callbacks.onPreRestart && typeof callbacks.onPreRestart === 'function') {
-        // Signal that standby stream should be created
         callbacks.onPreRestart();
       }
-    }, STREAM_DURATION_LIMIT);
+    }, STANDBY_CREATION_TIME);
+
+    // Set up HARD restart timer - force restart before hitting Google's limit
+    const hardRestartTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Hard restart timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s - forcing restart`);
+      if (callbacks && callbacks.onRestart && typeof callbacks.onRestart === 'function') {
+        callbacks.onRestart();
+      }
+    }, HARD_RESTART_TIME);
+
+    // Health check - detect silent stream failures
+    const healthCheckInterval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceData = now - streamHealth.lastDataTime;
+      const timeSinceAudio = now - streamHealth.lastAudioTime;
+      const streamAge = now - streamHealth.createdAt;
+      
+      // If we've received audio recently but no data for 30+ seconds, stream may be dead
+      if (timeSinceAudio < 5000 && timeSinceData > DATA_TIMEOUT) {
+        console.warn(`⚠️ [STREAM] Health check failed: No data for ${timeSinceData / 1000}s while audio still flowing. Forcing restart.`);
+        clearInterval(healthCheckInterval);
+        if (callbacks && callbacks.onRestart && typeof callbacks.onRestart === 'function') {
+          callbacks.onRestart();
+        }
+      }
+      
+      // Log health status periodically (every minute)
+      if (streamAge > 0 && streamAge % 60000 < HEALTH_CHECK_INTERVAL) {
+        console.log(`📊 [STREAM] Health: age=${Math.round(streamAge / 1000)}s, lastData=${Math.round(timeSinceData / 1000)}s ago, lastAudio=${Math.round(timeSinceAudio / 1000)}s ago`);
+      }
+    }, HEALTH_CHECK_INTERVAL);
     
-    // Attach timer to stream so server.js can clear it
+    // Attach timers to stream so they can be cleared
     recognizeStream._standbyTimer = standbyTimer;
+    recognizeStream._hardRestartTimer = hardRestartTimer;
+    recognizeStream._healthCheckInterval = healthCheckInterval;
 
     // Handle streaming responses - Works with both V1 and V2 models
     recognizeStream.on('data', (response) => {
+      // Update health tracking - we received data
+      if (recognizeStream._health) {
+        recognizeStream._health.lastDataTime = Date.now();
+      }
+      
       if (response.results && response.results.length > 0) {
         const result = response.results[0];
         if (result.alternatives && result.alternatives.length > 0) {
@@ -274,7 +325,12 @@ class SpeechToTextService {
         details: error.details,
         metadata: error.metadata
       });
+      
+      // Clear all timers
       clearTimeout(standbyTimer);
+      clearTimeout(hardRestartTimer);
+      clearInterval(healthCheckInterval);
+      
       // Mark stream as destroyed on error
       if (recognizeStream) {
         recognizeStream.destroyed = true;
@@ -307,14 +363,14 @@ class SpeechToTextService {
     });
 
     recognizeStream.on('end', () => {
+      console.log(`📊 [STREAM] Stream ended after ${(Date.now() - streamHealth.createdAt) / 1000}s`);
       clearTimeout(standbyTimer);
+      clearTimeout(hardRestartTimer);
+      clearInterval(healthCheckInterval);
       if (callbacks && callbacks.onEnd) {
         callbacks.onEnd();
       }
     });
-
-    // Store standby timer for cleanup
-    recognizeStream._standbyTimer = standbyTimer;
 
     return recognizeStream;
   }
@@ -326,6 +382,10 @@ class SpeechToTextService {
   sendAudioToStream(recognizeStream, audioBuffer) {
     if (recognizeStream && !recognizeStream.destroyed) {
       try {
+        // Update health tracking - we're sending audio
+        if (recognizeStream._health) {
+          recognizeStream._health.lastAudioTime = Date.now();
+        }
         recognizeStream.write(audioBuffer);
       } catch (error) {
         console.error('❌ Error writing to stream:', error);
@@ -338,10 +398,22 @@ class SpeechToTextService {
    */
   endStreamingRecognition(recognizeStream) {
     if (recognizeStream && !recognizeStream.destroyed) {
-      // Clear restart timer if it exists
+      // Clear all timers
       if (recognizeStream._restartTimer) {
         clearTimeout(recognizeStream._restartTimer);
         recognizeStream._restartTimer = null;
+      }
+      if (recognizeStream._standbyTimer) {
+        clearTimeout(recognizeStream._standbyTimer);
+        recognizeStream._standbyTimer = null;
+      }
+      if (recognizeStream._hardRestartTimer) {
+        clearTimeout(recognizeStream._hardRestartTimer);
+        recognizeStream._hardRestartTimer = null;
+      }
+      if (recognizeStream._healthCheckInterval) {
+        clearInterval(recognizeStream._healthCheckInterval);
+        recognizeStream._healthCheckInterval = null;
       }
       
       // Remove all event listeners to prevent further events
@@ -385,7 +457,7 @@ class SpeechToTextService {
    * Activate standby stream and switch to it (closing old stream)
    * This is called when a transcription bubble is finalized
    */
-  activateStandbyStream(socketId, oldStream) {
+  activateStandbyStream(socketId, oldStream, callbacks) {
     
     const standbyInfo = this.standbyStreams.get(socketId);
     if (!standbyInfo || !standbyInfo.stream) {
@@ -393,15 +465,81 @@ class SpeechToTextService {
       return null;
     }
     
+    console.log(`🔄 [STANDBY] Activating standby stream for ${socketId}`);
+    
     // Close the old stream cleanly
     if (oldStream && !oldStream.destroyed) {
+      console.log(`🔄 [STANDBY] Closing old stream for ${socketId}`);
       this.endStreamingRecognition(oldStream);
     }
+    
+    const standbyStream = standbyInfo.stream;
+    const now = Date.now();
+    
+    // Clear old timers (they were running since standby creation)
+    if (standbyStream._standbyTimer) {
+      clearTimeout(standbyStream._standbyTimer);
+    }
+    if (standbyStream._hardRestartTimer) {
+      clearTimeout(standbyStream._hardRestartTimer);
+    }
+    if (standbyStream._healthCheckInterval) {
+      clearInterval(standbyStream._healthCheckInterval);
+    }
+    
+    // Reset the stream's health tracking - it's now the active stream
+    if (standbyStream._health) {
+      standbyStream._health.createdAt = now;
+      standbyStream._health.lastDataTime = now;
+      standbyStream._health.lastAudioTime = now;
+    }
+    
+    // Use provided callbacks or the ones from standby creation
+    const activeCallbacks = callbacks || standbyInfo.callbacks;
+    
+    // Set up fresh timers for the now-active stream
+    const STANDBY_CREATION_TIME = (3.5 * 60 * 1000);
+    const HARD_RESTART_TIME = (4.5 * 60 * 1000);
+    const HEALTH_CHECK_INTERVAL = 10000;
+    const DATA_TIMEOUT = 30000;
+    
+    standbyStream._standbyTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Standby timer fired for activated stream`);
+      if (activeCallbacks && activeCallbacks.onPreRestart) {
+        activeCallbacks.onPreRestart();
+      }
+    }, STANDBY_CREATION_TIME);
+    
+    standbyStream._hardRestartTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Hard restart timer fired for activated stream`);
+      if (activeCallbacks && activeCallbacks.onRestart) {
+        activeCallbacks.onRestart();
+      }
+    }, HARD_RESTART_TIME);
+    
+    standbyStream._healthCheckInterval = setInterval(() => {
+      const health = standbyStream._health;
+      if (!health) return;
+      
+      const checkTime = Date.now();
+      const timeSinceData = checkTime - health.lastDataTime;
+      const timeSinceAudio = checkTime - health.lastAudioTime;
+      
+      if (timeSinceAudio < 5000 && timeSinceData > DATA_TIMEOUT) {
+        console.warn(`⚠️ [STREAM] Health check failed on activated stream`);
+        clearInterval(standbyStream._healthCheckInterval);
+        if (activeCallbacks && activeCallbacks.onRestart) {
+          activeCallbacks.onRestart();
+        }
+      }
+    }, HEALTH_CHECK_INTERVAL);
     
     // Remove standby from map (it's now the active stream)
     this.standbyStreams.delete(socketId);
     
-    return standbyInfo.stream;
+    console.log(`✅ [STANDBY] Standby stream activated with fresh timers for ${socketId}`);
+    
+    return standbyStream;
   }
 
   /**
