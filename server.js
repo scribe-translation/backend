@@ -313,6 +313,36 @@ messageQueue = new MessageQueue(io)
 
 io.on('connection', async (socket) => {
   
+  // Log new connection
+  console.log(`🔗 New connection: ${socket.id} (user: ${socket.user?.email || 'listener'}, userCode: ${socket.userCode})`);
+  console.log(`📊 Total connections before add: ${activeConnections.size}`);
+  
+  // Check for stale connections from same user and clean them up
+  if (socket.user?.id) {
+    const staleConnections = [];
+    activeConnections.forEach((conn, socketId) => {
+      if (conn.userId === socket.user.id && socketId !== socket.id) {
+        // Check if the socket is actually disconnected
+        const existingSocket = io.sockets.sockets.get(socketId);
+        if (!existingSocket || !existingSocket.connected) {
+          staleConnections.push(socketId);
+        }
+      }
+    });
+    
+    // Clean up stale connections
+    if (staleConnections.length > 0) {
+      console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for user ${socket.user.email}`);
+      staleConnections.forEach(socketId => {
+        activeConnections.delete(socketId);
+        streamingSessions.delete(socketId);
+        restartingStreams.delete(socketId);
+        audioBufferDuringRestart.delete(socketId);
+        currentBubbleIds.delete(socketId);
+      });
+    }
+  }
+  
   activeConnections.set(socket.id, {
     userId: socket.user?.id,
     userEmail: socket.user?.email,
@@ -330,6 +360,8 @@ io.on('connection', async (socket) => {
     streamStartTime: null,  // Track when streaming session started
     sessionCounted: false   // Prevent double-counting sessions
   })
+  
+  console.log(`📊 Total connections after add: ${activeConnections.size}`);
   
   // Update lastActive for authenticated users
   if (socket.user?.id) {
@@ -1334,6 +1366,9 @@ io.on('connection', async (socket) => {
   socket.on('disconnect', async () => {
     const connection = activeConnections.get(socket.id)
     
+    console.log(`🔌 Disconnect: ${socket.id} (user: ${connection?.userEmail || 'listener'})`)
+    console.log(`📊 Total connections before remove: ${activeConnections.size}`)
+    
     // Clean up ping timeout
     if (connection && connection.pingTimeout) {
       clearTimeout(connection.pingTimeout)
@@ -1399,9 +1434,47 @@ io.on('connection', async (socket) => {
     
     activeConnections.delete(socket.id)
     
+    console.log(`📊 Total connections after remove: ${activeConnections.size}`)
+    
     emitConnectionCount(connection?.userCode)
   })
 })
+
+// Periodic cleanup of orphaned connections (every 30 seconds)
+setInterval(() => {
+  const orphanedConnections = [];
+  
+  activeConnections.forEach((conn, socketId) => {
+    const socket = io.sockets.sockets.get(socketId);
+    if (!socket || !socket.connected) {
+      orphanedConnections.push(socketId);
+    }
+  });
+  
+  if (orphanedConnections.length > 0) {
+    console.log(`🧹 [Cleanup] Found ${orphanedConnections.length} orphaned connections, cleaning up...`);
+    orphanedConnections.forEach(socketId => {
+      const conn = activeConnections.get(socketId);
+      console.log(`  - Removing orphan: ${socketId} (user: ${conn?.userEmail || 'listener'})`);
+      
+      // Clean up associated resources
+      const recognizeStream = streamingSessions.get(socketId);
+      if (recognizeStream) {
+        speechToTextService.endStreamingRecognition(recognizeStream);
+        streamingSessions.delete(socketId);
+      }
+      speechToTextService.cleanupStandbyStream(socketId);
+      restartingStreams.delete(socketId);
+      audioBufferDuringRestart.delete(socketId);
+      currentBubbleIds.delete(socketId);
+      activeConnections.delete(socketId);
+    });
+    
+    // Emit updated connection count
+    emitConnectionCount();
+    console.log(`📊 Total connections after cleanup: ${activeConnections.size}`);
+  }
+}, 30000);
 
 // Helper function to notify listeners when interim transcription is active
 function notifyInterimTranscription(socket, sourceLanguage) {
