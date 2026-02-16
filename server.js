@@ -318,29 +318,53 @@ io.on('connection', async (socket) => {
   console.log(`📊 Total connections before add: ${activeConnections.size}`);
   
   // Check for stale connections from same user and clean them up
-  if (socket.user?.id) {
-    const staleConnections = [];
-    activeConnections.forEach((conn, socketId) => {
-      if (conn.userId === socket.user.id && socketId !== socket.id) {
-        // Check if the socket is actually disconnected
-        const existingSocket = io.sockets.sockets.get(socketId);
-        if (!existingSocket || !existingSocket.connected) {
-          staleConnections.push(socketId);
-        }
+  // This handles both authenticated users (speakers) and listeners (userCode only)
+  const staleConnections = [];
+  
+  activeConnections.forEach((conn, socketId) => {
+    if (socketId === socket.id) return; // Skip current connection
+    
+    // Check for same authenticated user (speaker)
+    const isSameAuthUser = socket.user?.id && conn.userId === socket.user.id;
+    
+    // Check for same listener (same userCode, both are listeners without userId)
+    // Note: We identify listeners as connections with userCode but no userId (or no isStreaming)
+    const isSameListener = !socket.user?.id && socket.userCode && 
+                          conn.userCode === socket.userCode && !conn.userId;
+    
+    if (isSameAuthUser || isSameListener) {
+      // Check if the existing socket is actually disconnected
+      const existingSocket = io.sockets.sockets.get(socketId);
+      if (!existingSocket || !existingSocket.connected) {
+        staleConnections.push(socketId);
+      }
+    }
+  });
+  
+  // Clean up stale connections immediately
+  if (staleConnections.length > 0) {
+    const identifier = socket.user?.email || `listener-${socket.userCode}`;
+    console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for ${identifier}`);
+    staleConnections.forEach(socketId => {
+      console.log(`  - Removing stale socket: ${socketId}`);
+      // Clean up all associated state
+      const recognizeStream = streamingSessions.get(socketId);
+      if (recognizeStream) {
+        speechToTextService.endStreamingRecognition(recognizeStream);
+        streamingSessions.delete(socketId);
+      }
+      speechToTextService.cleanupStandbyStream(socketId);
+      activeConnections.delete(socketId);
+      restartingStreams.delete(socketId);
+      audioBufferDuringRestart.delete(socketId);
+      currentBubbleIds.delete(socketId);
+      cleanupContentHashes(socketId);
+      if (messageQueue) {
+        messageQueue.cleanupListener(socketId);
       }
     });
-    
-    // Clean up stale connections
-    if (staleConnections.length > 0) {
-      console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for user ${socket.user.email}`);
-      staleConnections.forEach(socketId => {
-        activeConnections.delete(socketId);
-        streamingSessions.delete(socketId);
-        restartingStreams.delete(socketId);
-        audioBufferDuringRestart.delete(socketId);
-        currentBubbleIds.delete(socketId);
-      });
-    }
+    // Emit updated connection count immediately after cleanup
+    emitConnectionCount(socket.userCode);
   }
   
   activeConnections.set(socket.id, {
@@ -373,13 +397,14 @@ io.on('connection', async (socket) => {
   }
 
   // Set up heartbeat mechanism
+  // Server timeout is a safety net - clients should detect and reconnect faster
   const connection = activeConnections.get(socket.id)
   if (connection) {
-    // Set initial ping timeout (30 seconds)
+    // Set initial ping timeout (45 seconds - acts as safety net, client should reconnect faster)
     connection.pingTimeout = setTimeout(() => {
       console.log(`💔 Heartbeat timeout for socket ${socket.id}, disconnecting...`)
       socket.disconnect(true)
-    }, 30000)
+    }, 45000)
   }
 
   if (socket.needsTokenRefresh) {
@@ -413,9 +438,10 @@ io.on('connection', async (socket) => {
         clearTimeout(connection.pingTimeout)
       }
       
-      // Adaptive timeout based on connection quality
-      const timeoutDuration = connection.connectionQuality === 'critical' ? 15000 : 
-                            connection.connectionQuality === 'poor' ? 25000 : 30000
+      // Adaptive timeout based on connection quality (increased - acts as safety net)
+      // Client should detect and reconnect faster (15s) before these timeouts trigger
+      const timeoutDuration = connection.connectionQuality === 'critical' ? 25000 : 
+                            connection.connectionQuality === 'poor' ? 35000 : 45000
       
       connection.pingTimeout = setTimeout(() => {
         console.log(`💔 Heartbeat timeout for socket ${socket.id} (quality: ${connection.connectionQuality}), disconnecting...`)
@@ -1294,6 +1320,31 @@ io.on('connection', async (socket) => {
       speechToTextService.endStreamingRecognition(recognizeStream)
       streamingSessions.delete(socket.id)
     }
+  })
+
+  // Handle client request for stream restart (e.g., when client detects hung stream)
+  socket.on('requestStreamRestart', (data) => {
+    console.log(`🔄 Client ${socket.id} requested stream restart: ${data?.reason || 'unknown'}`);
+    
+    // End existing stream
+    const recognizeStream = streamingSessions.get(socket.id);
+    if (recognizeStream) {
+      speechToTextService.endStreamingRecognition(recognizeStream);
+      streamingSessions.delete(socket.id);
+    }
+    
+    // Clean up any standby streams
+    speechToTextService.cleanupStandbyStream(socket.id);
+    
+    // Clear restart state
+    restartingStreams.delete(socket.id);
+    audioBufferDuringRestart.delete(socket.id);
+    
+    // Notify client to restart stream - a new stream will be created on next audio chunk
+    socket.emit('streamRestart', { 
+      reason: data?.reason || 'client_request',
+      timestamp: Date.now()
+    });
   })
 
   socket.on('setTargetLanguage', (data) => {

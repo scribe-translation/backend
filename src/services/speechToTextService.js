@@ -72,6 +72,7 @@ class SpeechToTextService {
   }
 
   /**
+  /**
    * Convert WebM audio to LINEAR16 format using FFmpeg
    */
   async convertWebMToLinear16(webmBuffer) {
@@ -147,49 +148,86 @@ class SpeechToTextService {
 
   /**
    * Get the best model for a given language code
-   * V1 API models: default, phone_call, video, command_and_search, latest_long, latest_short
-   * phone_call is best for conversational speech
+   * V1 API models: default, latest_long, latest_short, telephony, telephony_short
+   * latest_long is Google's newest Conformer-based model with best quality
    */
   getBestModelForLanguage(languageCode) {
-    // V1 API model selection - phone_call is optimized for conversational speech
-    const modelMap = {
-      // English - full enhanced support
-      'en-US': { model: 'telephony', useEnhanced: true },
-      'en-GB': { model: 'telephony', useEnhanced: true },
-      'en-AU': { model: 'telephony', useEnhanced: true },
-      'en-CA': { model: 'telephony', useEnhanced: false },
-      'en-IN': { model: 'telephony', useEnhanced: true },
-      
-      // French - phone_call for conversational
-      'fr-FR': { model: 'telephony', useEnhanced: false },
-      'fr-CA': { model: 'telephony', useEnhanced: false },
-      'fr-BE': { model: 'telephony', useEnhanced: false },
-      'fr-CH': { model: 'telephony', useEnhanced: false },
-      
+    // Languages that support latest_long (highest quality, Conformer-based)
+    const latestLongSupported = new Set([
+      // English
+      'en-US', 'en-GB', 'en-AU', 'en-IN',
+      // French
+      'fr-FR', 'fr-CA',
       // Spanish
-      'es-ES': { model: 'telephony', useEnhanced: false },
-      'es-MX': { model: 'telephony', useEnhanced: false },
-      'es-US': { model: 'telephony', useEnhanced: false },
-      'es-419': { model: 'telephony', useEnhanced: false },
-      'es-CO': { model: 'telephony', useEnhanced: false },
-      
-      // Other languages
-      'pt-BR': { model: 'telephony', useEnhanced: false },
-      'de-DE': { model: 'telephony', useEnhanced: false },
-      'it-IT': { model: 'telephony', useEnhanced: false },
-      'ja-JP': { model: 'telephony', useEnhanced: false },
-    };
+      'es-ES', 'es-US',
+      // German
+      'de-DE',
+      // Portuguese
+      'pt-BR', 'pt-PT',
+      // Italian
+      'it-IT',
+      // Japanese
+      'ja-JP',
+      // Korean
+      'ko-KR',
+      // Russian
+      'ru-RU',
+      // Arabic variants
+      'ar-DZ', 'ar-BH', 'ar-EG', 'ar-IQ', 'ar-IL', 'ar-JO', 'ar-KW', 'ar-LB',
+      'ar-MR', 'ar-MA', 'ar-OM', 'ar-QA', 'ar-SA', 'ar-PS', 'ar-TN', 'ar-AE', 'ar-YE',
+      // Asian languages
+      'hi-IN', 'vi-VN', 'th-TH', 'id-ID',
+      // European languages
+      'nl-NL', 'sv-SE', 'da-DK', 'fi-FI', 'no-NO', 'pl-PL', 'cs-CZ', 'tr-TR', 'uk-UA',
+      // Indian languages
+      'bn-BD', 'ta-IN', 'te-IN', 'kn-IN', 'ml-IN', 'mr-IN',
+      // Other
+      'ro-RO', 'bg-BG', 'hu-HU', 'km-KH'
+    ]);
     
-    if (modelMap[languageCode]) {
-      return modelMap[languageCode];
+    // Languages with telephony support (good for conversational, fallback)
+    const telephonySupported = new Set([
+      'en-US', 'en-GB', 'en-AU', 'en-CA', 'en-IN', 'en-IE', 'en-NZ', 'en-SG',
+      'en-HK', 'en-PK',
+      'fr-FR', 'fr-CA', 'fr-BE', 'fr-CH',
+      'es-ES', 'es-US', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE',
+      'de-DE', 'de-AT', 'de-CH',
+      'pt-BR', 'pt-PT',
+      'it-IT', 'it-CH',
+      'ja-JP',
+      'ko-KR',
+      'nl-NL', 'nl-BE',
+      'hi-IN'
+    ]);
+    
+    // Check for latest_long support (preferred - highest quality)
+    if (latestLongSupported.has(languageCode)) {
+      return { model: 'latest_long', useEnhanced: false };
     }
     
-    // Fallback by language prefix
-    const langPrefix = languageCode.split('-')[0];
-    if (['en', 'fr', 'de', 'it', 'ja', 'pt'].includes(langPrefix)) {
+    // Check for telephony support (good quality, conversational)
+    if (telephonySupported.has(languageCode)) {
       return { model: 'telephony', useEnhanced: false };
     }
     
+    // Fallback by language prefix to latest_long or telephony
+    const langPrefix = languageCode.split('-')[0];
+    
+    // Check if any variant of this language supports latest_long
+    for (const lang of latestLongSupported) {
+      if (lang.startsWith(langPrefix + '-')) {
+        return { model: 'latest_long', useEnhanced: false };
+      }
+    }
+    
+    // Check if any variant supports telephony
+    for (const lang of telephonySupported) {
+      if (lang.startsWith(langPrefix + '-')) {
+        return { model: 'telephony', useEnhanced: false };
+      }
+    }
+    
+    // Ultimate fallback to default (supports all languages)
     return { model: 'default', useEnhanced: false };
   }
 
@@ -377,7 +415,7 @@ class SpeechToTextService {
 
   /**
    * Send audio data to streaming recognition
-   * V1 API: Audio is sent directly as buffer
+   * Audio is sent directly as buffer to the streaming recognition
    */
   sendAudioToStream(recognizeStream, audioBuffer) {
     if (recognizeStream && !recognizeStream.destroyed) {
