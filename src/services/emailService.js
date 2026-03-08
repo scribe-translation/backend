@@ -65,8 +65,8 @@ class EmailService {
    */
   async sendPasswordResetEmail(to, resetToken, userName, subdomain = 'speaker') {
     try {
-      const baseUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-      const domain = process.env.FRONTEND_DOMAIN || 'scribe-ai.ca';
+      const baseUrl = process.env.FRONTEND_URL;
+      const domain = process.env.FRONTEND_DOMAIN;
 
       let resetUrl;
       if (baseUrl.includes('localhost')) {
