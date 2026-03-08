@@ -1,19 +1,27 @@
+const { Resend } = require('resend');
 const sgMail = require('@sendgrid/mail');
 const nodemailer = require('nodemailer');
 
 class EmailService {
   constructor() {
     this.transporter = null;
+    this.resend = null;
     this.initializeService();
   }
 
   initializeService() {
-    // Try SendGrid first (production)
+    // Resend (preferred when configured - reliable, free tier: 3000/month)
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      this.resend = new Resend(resendApiKey);
+      console.log('Resend email service initialized');
+    }
+
+    // SendGrid (production)
     const sendGridApiKey = process.env.SENDGRID_API_KEY;
     if (sendGridApiKey) {
       sgMail.setApiKey(sendGridApiKey);
       console.log('SendGrid email service initialized');
-      return;
     }
 
     // Fallback to SMTP (development/production)
@@ -42,8 +50,8 @@ class EmailService {
     if (smtpConfig.auth.user && smtpConfig.auth.pass) {
       this.transporter = nodemailer.createTransport(smtpConfig);
       console.log('SMTP email service initialized');
-    } else {
-      console.warn('No email credentials found. Set SENDGRID_API_KEY or SMTP_USER/SMTP_PASS. Email service will log to console.');                                                                                      
+    } else if (!this.resend && !sendGridApiKey) {
+      console.warn('No email credentials found. Set RESEND_API_KEY, SENDGRID_API_KEY, or SMTP_USER/SMTP_PASS. Email service will log to console.');
     }
   }
 
@@ -158,7 +166,21 @@ class EmailService {
         `
       };
 
-      // Try SendGrid first (production)
+      // Try Resend first (reliable, free tier)
+      if (this.resend) {
+        const { data, error } = await this.resend.emails.send({
+          from: msg.from,
+          to: msg.to,
+          subject: msg.subject,
+          html: msg.html,
+          text: msg.text
+        });
+        if (error) throw error;
+        console.log('Password reset email sent via Resend:', data?.id);
+        return data;
+      }
+
+      // Try SendGrid (production)
       if (process.env.SENDGRID_API_KEY) {
         const info = await sgMail.send(msg);
         console.log('Password reset email sent via SendGrid:', info[0].headers['x-message-id']);
@@ -232,7 +254,20 @@ class EmailService {
         `
       };
 
-      // Try SendGrid first (production)
+      // Try Resend first
+      if (this.resend) {
+        const { data, error } = await this.resend.emails.send({
+          from: msg.from,
+          to: msg.to,
+          subject: msg.subject,
+          html: msg.html
+        });
+        if (error) throw error;
+        console.log('Welcome email sent via Resend:', data?.id);
+        return data;
+      }
+
+      // Try SendGrid (production)
       if (process.env.SENDGRID_API_KEY) {
         const info = await sgMail.send(msg);
         console.log('Welcome email sent via SendGrid:', info[0].headers['x-message-id']);
@@ -264,20 +299,32 @@ class EmailService {
    */
   async testConnection() {
     try {
-      if (!process.env.SENDGRID_API_KEY) {
-        console.log('Email service ready (development mode)');
+      const from = process.env.FROM_EMAIL || 'noreply@scribe-ai.ca';
+
+      if (this.resend) {
+        const { error } = await this.resend.emails.send({
+          from,
+          to: 'test@example.com',
+          subject: 'Test Email',
+          text: 'This is a test email'
+        });
+        if (error) throw error;
+        console.log('Email service is ready (Resend)');
         return true;
       }
-      
-      // Test with a simple API call
-      const response = await sgMail.send({
-        to: 'test@example.com',
-        from: process.env.FROM_EMAIL || 'noreply@scribe-ai.ca',
-        subject: 'Test Email',
-        text: 'This is a test email'
-      });
-      
-      console.log('Email service is ready');
+
+      if (process.env.SENDGRID_API_KEY) {
+        await sgMail.send({
+          to: 'test@example.com',
+          from,
+          subject: 'Test Email',
+          text: 'This is a test email'
+        });
+        console.log('Email service is ready (SendGrid)');
+        return true;
+      }
+
+      console.log('Email service ready (development mode)');
       return true;
     } catch (error) {
       console.error('Email service connection failed:', error);

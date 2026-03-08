@@ -41,6 +41,7 @@
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^7.0.6",
     "qrcode": "^1.5.4",
+    "resend": "^4.0.0",
     "socket.io": "^4.7.2",
     "speakeasy": "^2.0.0"
   },
