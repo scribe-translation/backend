@@ -25,6 +25,7 @@ module.exports = {
   
   // Frontend URLs
   FRONTEND_URL: 'http://speaker.localhost:5173',
+  FRONTEND_DOMAIN: 'localhost',
   TRANSLATION_URL: 'http://listener.localhost:5173',
   
   // Logging

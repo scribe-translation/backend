@@ -22,6 +22,7 @@ module.exports = {
   
   // Frontend URLs
   FRONTEND_URL: process.env.FRONTEND_URL || 'https://speaker.scribe-ai.ca',
+  FRONTEND_DOMAIN: process.env.FRONTEND_DOMAIN || 'scribe-ai.ca',
   TRANSLATION_URL: process.env.TRANSLATION_URL || 'https://listener.scribe-ai.ca',
   
   // Google Cloud

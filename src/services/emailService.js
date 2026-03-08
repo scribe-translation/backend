@@ -66,15 +66,15 @@ class EmailService {
   async sendPasswordResetEmail(to, resetToken, userName, subdomain = 'speaker') {
     try {
       const baseUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-      
-      // Handle production URLs properly
+      const domain = process.env.FRONTEND_DOMAIN || 'scribe-ai.ca';
+
       let resetUrl;
       if (baseUrl.includes('localhost')) {
         // Development: replace localhost with subdomain.localhost
         resetUrl = `${baseUrl.replace('localhost', `${subdomain}.localhost`)}/reset-password?token=${resetToken}`;
       } else {
-        // Production: use subdomain.scribe-ai.ca
-        resetUrl = `https://${subdomain}.scribe-ai.ca/reset-password?token=${resetToken}`;
+        // Production / any non-dev: never use localhost; use real domain
+        resetUrl = `https://${subdomain}.${domain}/reset-password?token=${resetToken}`;
       }
       
       const msg = {
