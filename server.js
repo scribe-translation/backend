@@ -10,7 +10,7 @@ const { authenticateSocket, authenticateToken } = require('./src/middleware/auth
 const authRoutes = require('./src/routes/auth')
 const { initFirestore } = require('./src/database/firestore')
 const User = require('./src/models/User')
-const Sermon = require('./src/models/Sermon')
+const Session = require('./src/models/Session')
 const speechToTextService = require('./src/services/speechToTextService')
 const googleTranslationService = require('./src/services/googleTranslationService')
 const textToSpeechService = require('./src/services/textToSpeechService')
@@ -269,7 +269,7 @@ async function handleBackgroundProcessing(socketId, connectionData) {
             console.log(`📝 Processing transcription background task for user ${connectionData.userId}...`);
 
             // Save to database
-            const sermon = await Sermon.create({
+            const sessionData = await Session.create({
                 userId: connectionData.userId,
                 fullText: accumulatedText,
                 sourceLanguage: connectionData.sourceLanguage || 'en-US'
@@ -294,9 +294,9 @@ async function handleBackgroundProcessing(socketId, connectionData) {
                 return null;
             })));
 
-            // Update sermon with AI content if generated
+            // Update session with AI content if generated
             if (summary || facebookPost) {
-                await Sermon.update(sermon.id, {
+                await Session.update(sessionData.id, {
                     summary: summary || null,
                     facebookPost: facebookPost || null
                 });
@@ -1835,39 +1835,39 @@ app.get('/api/tts/supported', (req, res) => {
     res.json({ languageCode, supported })
 })
 
-app.get('/api/sermons', authenticateToken, async (req, res) => {
+app.get('/api/sessions', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const limit = parseInt(req.query.limit) || 20;
-        const sermons = await Sermon.findByUserId(userId, limit);
-        res.json({ sermons });
+        const sessions = await Session.findByUserId(userId, limit);
+        res.json({ sessions });
     } catch (error) {
-        console.error('Error fetching sermons:', error);
-        res.status(500).json({ error: 'Failed to fetch sermons' });
+        console.error('Error fetching sessions:', error);
+        res.status(500).json({ error: 'Failed to fetch sessions' });
     }
 })
 
-app.delete('/api/sermons/:id', authenticateToken, async (req, res) => {
+app.delete('/api/sessions/:id', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const { id } = req.params;
 
-        const sermon = await Sermon.findById(id);
+        const sessionData = await Session.findById(id);
         
-        if (!sermon) {
-            return res.status(404).json({ error: 'Sermon not found' });
+        if (!sessionData) {
+            return res.status(404).json({ error: 'Session not found' });
         }
 
         // Check if the current user is the owner
-        if (sermon.userId !== userId) {
-            return res.status(403).json({ error: 'Unauthorized: You can only delete your own sermons' });
+        if (sessionData.userId !== userId) {
+            return res.status(403).json({ error: 'Unauthorized: You can only delete your own sessions' });
         }
 
-        await Sermon.delete(id);
-        res.json({ success: true, message: 'Sermon deleted successfully' });
+        await Session.delete(id);
+        res.json({ success: true, message: 'Session deleted successfully' });
     } catch (error) {
-        console.error('Error deleting sermon:', error);
-        res.status(500).json({ error: 'Failed to delete sermon' });
+        console.error('Error deleting session:', error);
+        res.status(500).json({ error: 'Failed to delete session' });
     }
 })
 
