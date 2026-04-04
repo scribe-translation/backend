@@ -15,6 +15,7 @@ const speechToTextService = require('./src/services/speechToTextService')
 const googleTranslationService = require('./src/services/googleTranslationService')
 const textToSpeechService = require('./src/services/textToSpeechService')
 const aiService = require('./src/services/aiService')
+const { isSameLanguage } = require('./src/utils/languageCodeMapper')
 const app = express()
 const server = http.createServer(app)
 
@@ -56,6 +57,9 @@ const currentBubbleIds = new Map() // Track current bubbleId per socket (updated
 const contentHashes = new Map() // Track content hashes for deduplication
 const typingIndicatorTimeouts = new Map() // Track typing indicator timeouts per socket
 const streamRotationBubbleId = new Map() // Lock bubbleId for STT results during lazy rotation window
+
+const interimTranslationThrottle = new Map()
+const INTERIM_THROTTLE_MS = 1000
 
 // ============================================================================
 // CONTENT HASH DEDUPLICATION - Prevents duplicates from overlapping streams
@@ -403,7 +407,7 @@ function createStreamCallbacks(socket) {
             })
 
             if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                notifyInterimTranscription(socket, sourceLanguage)
+                notifyInterimTranscription(socket, sourceLanguage, result.transcript.trim())
             }
 
             if (result.isFinal && result.transcript.trim()) {
@@ -1300,6 +1304,8 @@ io.on('connection', async (socket) => {
             typingIndicatorTimeouts.delete(socket.id)
         }
 
+        interimTranslationThrottle.delete(socket.id)
+
         // Clean up any standby streams
         speechToTextService.cleanupStandbyStream(socket.id)
         streamRotationBubbleId.delete(socket.id)
@@ -1378,8 +1384,7 @@ setInterval(() => {
     }
 }, 30000);
 
-// Helper function to notify listeners when interim transcription is active
-function notifyInterimTranscription(socket, sourceLanguage) {
+async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
     const currentConnection = activeConnections.get(socket.id);
     if (!currentConnection?.userCode) return;
 
@@ -1392,13 +1397,71 @@ function notifyInterimTranscription(socket, sourceLanguage) {
         return conn && !conn.isStreaming && conn.targetLanguage;
     });
 
-    // Notify all listener connections that speaker is typing
+    if (translationConnections.length === 0) return;
+
+    const listenersByLanguage = new Map();
     translationConnections.forEach(socketId => {
-        const targetSocket = io.sockets.sockets.get(socketId);
-        if (targetSocket) {
-            targetSocket.emit('speakerTyping', { isTyping: true });
+        const conn = activeConnections.get(socketId);
+        if (conn?.targetLanguage) {
+            if (!listenersByLanguage.has(conn.targetLanguage)) {
+                listenersByLanguage.set(conn.targetLanguage, []);
+            }
+            listenersByLanguage.get(conn.targetLanguage).push(socketId);
         }
     });
+
+    if (!interimTranslationThrottle.has(socket.id)) {
+        interimTranslationThrottle.set(socket.id, new Map());
+    }
+    const speakerThrottle = interimTranslationThrottle.get(socket.id);
+
+    // Process each unique target language
+    for (const [targetLanguage, listenerSocketIds] of listenersByLanguage) {
+        let textToSend = interimText;
+        let translatedText = null;
+
+        if (isSameLanguage(sourceLanguage, targetLanguage)) {
+            textToSend = interimText;
+        } else {
+            const throttleEntry = speakerThrottle.get(targetLanguage);
+            const now = Date.now();
+
+            if (throttleEntry && (now - throttleEntry.timestamp) < INTERIM_THROTTLE_MS) {
+                translatedText = throttleEntry.translatedText;
+                textToSend = translatedText || interimText;
+            } else {
+                // Throttle expired or first request -> translate
+                try {
+                    translatedText = await googleTranslationService.translateText(
+                        interimText,
+                        sourceLanguage,
+                        targetLanguage
+                    );
+                    textToSend = translatedText;
+
+                    speakerThrottle.set(targetLanguage, {
+                        timestamp: now,
+                        translatedText: translatedText
+                    });
+                } catch (error) {
+                    console.error(`❌ Interim translation error (${sourceLanguage} → ${targetLanguage}):`, error.message);
+                    textToSend = interimText;
+                }
+            }
+        }
+
+        listenerSocketIds.forEach(socketId => {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (targetSocket) {
+                targetSocket.emit('speakerTyping', {
+                    isTyping: true,
+                    interimText: interimText,
+                    translatedInterimText: translatedText || textToSend,
+                    sourceLanguage: sourceLanguage
+                });
+            }
+        });
+    }
 
     // Clear existing timeout for this socket
     if (typingIndicatorTimeouts.has(socket.id)) {
@@ -1414,6 +1477,7 @@ function notifyInterimTranscription(socket, sourceLanguage) {
             }
         });
         typingIndicatorTimeouts.delete(socket.id);
+        interimTranslationThrottle.delete(socket.id);
     }, 2000);
 
     typingIndicatorTimeouts.set(socket.id, timeout);
