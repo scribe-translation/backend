@@ -11,9 +11,20 @@ class SpeechToTextService {
     this.credentials = null;
     // Note: Client initialization is deferred to getSpeechClient() for faster startup
     
-    // Standby stream management (clean handoff approach)
-    this.standbyStreams = new Map(); // socketId -> { stream, callbacks, createdAt }
-    this.PRE_RESTART_BUFFER = 90000; // Create standby stream 1.5 minutes before limit
+    // Lazy rotation: flag set at ~3.5m; new Google stream opens on next final or forced at ~4.5m
+    this.standbyNeededBySocket = new Map(); // socketId -> true
+  }
+
+  markStandbyNeeded(socketId) {
+    this.standbyNeededBySocket.set(socketId, true);
+  }
+
+  isStandbyNeeded(socketId) {
+    return this.standbyNeededBySocket.get(socketId) === true;
+  }
+
+  clearStandbyNeeded(socketId) {
+    this.standbyNeededBySocket.delete(socketId);
   }
 
   async initializeCredentials() {
@@ -466,136 +477,10 @@ class SpeechToTextService {
   }
 
   /**
-   * Create a standby stream that will be activated when current transcription is finalized
-   * This stream is created but does not receive audio until activated
-   */
-  async createStandbyStream(socketId, languageCode, speechEndTimeout, callbacks) {
-    
-    try {
-      // Create the stream but don't send audio to it yet
-      const standbyStream = await this.startStreamingRecognition(languageCode, speechEndTimeout, callbacks);
-      
-      // Store standby stream info
-      this.standbyStreams.set(socketId, {
-        stream: standbyStream,
-        callbacks: callbacks,
-        createdAt: Date.now(),
-        languageCode: languageCode,
-        speechEndTimeout: speechEndTimeout
-      });
-      
-      return standbyStream;
-    } catch (error) {
-      console.error(`❌ [STANDBY] Failed to create standby stream for ${socketId}:`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Activate standby stream and switch to it (closing old stream)
-   * This is called when a transcription bubble is finalized
-   */
-  activateStandbyStream(socketId, oldStream, callbacks) {
-    
-    const standbyInfo = this.standbyStreams.get(socketId);
-    if (!standbyInfo || !standbyInfo.stream) {
-      console.log(`⚠️ [STANDBY] No standby stream found for ${socketId}`);
-      return null;
-    }
-    
-    console.log(`🔄 [STANDBY] Activating standby stream for ${socketId}`);
-    
-    // Close the old stream cleanly
-    if (oldStream && !oldStream.destroyed) {
-      console.log(`🔄 [STANDBY] Closing old stream for ${socketId}`);
-      this.endStreamingRecognition(oldStream);
-    }
-    
-    const standbyStream = standbyInfo.stream;
-    const now = Date.now();
-    
-    // Clear old timers (they were running since standby creation)
-    if (standbyStream._standbyTimer) {
-      clearTimeout(standbyStream._standbyTimer);
-    }
-    if (standbyStream._hardRestartTimer) {
-      clearTimeout(standbyStream._hardRestartTimer);
-    }
-    if (standbyStream._healthCheckInterval) {
-      clearInterval(standbyStream._healthCheckInterval);
-    }
-    
-    // Reset the stream's health tracking - it's now the active stream
-    if (standbyStream._health) {
-      standbyStream._health.createdAt = now;
-      standbyStream._health.lastDataTime = now;
-      standbyStream._health.lastAudioTime = now;
-    }
-    
-    // Use provided callbacks or the ones from standby creation
-    const activeCallbacks = callbacks || standbyInfo.callbacks;
-    
-    // Set up fresh timers for the now-active stream
-    const STANDBY_CREATION_TIME = (3.5 * 60 * 1000);
-    const HARD_RESTART_TIME = (4.5 * 60 * 1000);
-    const HEALTH_CHECK_INTERVAL = 10000;
-    const DATA_TIMEOUT = 30000;
-    
-    standbyStream._standbyTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Standby timer fired for activated stream`);
-      if (activeCallbacks && activeCallbacks.onPreRestart) {
-        activeCallbacks.onPreRestart();
-      }
-    }, STANDBY_CREATION_TIME);
-    
-    standbyStream._hardRestartTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Hard restart timer fired for activated stream`);
-      if (activeCallbacks && activeCallbacks.onRestart) {
-        activeCallbacks.onRestart();
-      }
-    }, HARD_RESTART_TIME);
-    
-    standbyStream._healthCheckInterval = setInterval(() => {
-      const health = standbyStream._health;
-      if (!health) return;
-      
-      const checkTime = Date.now();
-      const timeSinceData = checkTime - health.lastDataTime;
-      const timeSinceAudio = checkTime - health.lastAudioTime;
-      
-      if (timeSinceAudio < 5000 && timeSinceData > DATA_TIMEOUT) {
-        console.warn(`⚠️ [STREAM] Health check failed on activated stream`);
-        clearInterval(standbyStream._healthCheckInterval);
-        if (activeCallbacks && activeCallbacks.onRestart) {
-          activeCallbacks.onRestart();
-        }
-      }
-    }, HEALTH_CHECK_INTERVAL);
-    
-    // Remove standby from map (it's now the active stream)
-    this.standbyStreams.delete(socketId);
-    
-    console.log(`✅ [STANDBY] Standby stream activated with fresh timers for ${socketId}`);
-    
-    return standbyStream;
-  }
-
-  /**
-   * Check if a standby stream exists for a socket
-   */
-  hasStandbyStream(socketId) {
-    return this.standbyStreams.has(socketId);
-  }
-
-  /**
-   * Clean up standby stream if it exists (e.g., on disconnect)
+   * Clear lazy-rotation flag (disconnect / language change / client restart)
    */
   cleanupStandbyStream(socketId) {
-    const standbyInfo = this.standbyStreams.get(socketId);
-    if (standbyInfo && standbyInfo.stream) {
-      this.endStreamingRecognition(standbyInfo.stream);
-    }
-    this.standbyStreams.delete(socketId);
+    this.standbyNeededBySocket.delete(socketId);
   }
 
 

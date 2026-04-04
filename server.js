@@ -55,6 +55,7 @@ const audioBufferDuringRestart = new Map() // Buffer audio during stream restart
 const currentBubbleIds = new Map() // Track current bubbleId per socket (updated by incoming audio)
 const contentHashes = new Map() // Track content hashes for deduplication
 const typingIndicatorTimeouts = new Map() // Track typing indicator timeouts per socket
+const streamRotationBubbleId = new Map() // Lock bubbleId for STT results during lazy rotation window
 
 // ============================================================================
 // CONTENT HASH DEDUPLICATION - Prevents duplicates from overlapping streams
@@ -379,6 +380,197 @@ async function processTranslations(translationConnections, transcript, sourceLan
 // Initialize the message queue
 messageQueue = new MessageQueue(io)
 
+function resolveSttBubbleId(socket) {
+    if (streamRotationBubbleId.has(socket.id)) {
+        const locked = streamRotationBubbleId.get(socket.id)
+        if (locked != null && locked !== '') return locked
+    }
+    return currentBubbleIds.get(socket.id)
+}
+
+function createStreamCallbacks(socket) {
+    return {
+        onResult: async (result) => {
+            const activeBubbleId = resolveSttBubbleId(socket) || ''
+            const sourceLanguage =
+                activeConnections.get(socket.id)?.sourceLanguage || 'en-CA'
+
+            socket.emit('transcriptionUpdate', {
+                transcript: result.transcript,
+                isFinal: result.isFinal,
+                confidence: result.confidence,
+                bubbleId: activeBubbleId
+            })
+
+            if (!result.isFinal && result.transcript && result.transcript.trim()) {
+                notifyInterimTranscription(socket, sourceLanguage)
+            }
+
+            if (result.isFinal && result.transcript.trim()) {
+                const currentConnection = activeConnections.get(socket.id)
+                if (currentConnection?.userCode) {
+                    const userCodeConnections = Array.from(activeConnections.entries())
+                        .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+                        .map(([socketId, _]) => socketId)
+
+                    const translationConnections = userCodeConnections.filter((sid) => {
+                        const conn = activeConnections.get(sid)
+                        return conn && !conn.isStreaming && conn.targetLanguage
+                    })
+
+                    translationConnections.forEach((socketId) => {
+                        const targetSocket = io.sockets.sockets.get(socketId)
+                        if (targetSocket) {
+                            targetSocket.emit('speakerTyping', { isTyping: false })
+                        }
+                    })
+
+                    if (typingIndicatorTimeouts.has(socket.id)) {
+                        clearTimeout(typingIndicatorTimeouts.get(socket.id))
+                        typingIndicatorTimeouts.delete(socket.id)
+                    }
+                }
+                socket.emit('finalResultReceived', { bubbleId: activeBubbleId })
+                await handleFinalTranscription(
+                    socket,
+                    result.transcript,
+                    sourceLanguage,
+                    activeBubbleId
+                )
+            }
+        },
+        onError: (error) => {
+            console.error('❌ Google Cloud streaming error:', error)
+            if (error.code === 14 || (error.message && error.message.includes('UNAVAILABLE'))) {
+                setTimeout(() => {
+                    if (socket.connected) {
+                        socket.emit('streamRestart', {
+                            reason: 'recovery',
+                            error: error.message
+                        })
+                    }
+                }, 1000)
+            }
+        },
+        onEnd: () => {
+            streamingSessions.delete(socket.id)
+        },
+        onPreRestart: () => {
+            const currentStream = streamingSessions.get(socket.id)
+            if (!currentStream) return
+            if (speechToTextService.isStandbyNeeded(socket.id)) return
+
+            speechToTextService.markStandbyNeeded(socket.id)
+            const b = currentBubbleIds.get(socket.id)
+            if (b) streamRotationBubbleId.set(socket.id, b)
+
+            if (socket.connected) {
+                socket.emit('streamRestartPending', {
+                    reason: 'stream_window',
+                    timestamp: Date.now()
+                })
+            }
+        },
+        onRestart: async () => {
+            await performHardStreamRestart(socket)
+        }
+    }
+}
+
+async function performHardStreamRestart(socket) {
+    speechToTextService.clearStandbyNeeded(socket.id)
+    streamRotationBubbleId.delete(socket.id)
+
+    restartingStreams.set(socket.id, true)
+    audioBufferDuringRestart.set(socket.id, [])
+
+    if (socket.connected) {
+        socket.emit('streamRestart', {
+            reason: '5-minute-limit-or-recovery',
+            timestamp: Date.now()
+        })
+    }
+
+    const oldStream = streamingSessions.get(socket.id)
+    if (oldStream) {
+        speechToTextService.endStreamingRecognition(oldStream)
+    }
+    streamingSessions.delete(socket.id)
+
+    const socketPrefix = `${socket.id}-`
+    for (const [key, _] of processedTranscripts.entries()) {
+        if (key.startsWith(socketPrefix)) {
+            processedTranscripts.delete(key)
+        }
+    }
+
+    const conn = activeConnections.get(socket.id)
+    const sourceLanguage = conn?.sourceLanguage || 'en-CA'
+    const speechEndTimeout = conn?.speechEndTimeout ?? 1.0
+
+    try {
+        const newStream = await speechToTextService.startStreamingRecognition(
+            sourceLanguage,
+            speechEndTimeout,
+            createStreamCallbacks(socket)
+        )
+        if (newStream) {
+            streamingSessions.set(socket.id, newStream)
+            const bufferedAudio = audioBufferDuringRestart.get(socket.id) || []
+            for (const audioBuffer of bufferedAudio) {
+                speechToTextService.sendAudioToStream(newStream, audioBuffer)
+            }
+        }
+    } catch (err) {
+        console.error('❌ performHardStreamRestart failed:', err)
+    }
+
+    restartingStreams.delete(socket.id)
+    audioBufferDuringRestart.delete(socket.id)
+
+    if (socket.connected) {
+        socket.emit('streamRestarted', {
+            newBubbleId: currentBubbleIds.get(socket.id) || null
+        })
+    }
+}
+
+async function performLazyStreamRotation(socket) {
+    if (!speechToTextService.isStandbyNeeded(socket.id)) return
+
+    speechToTextService.clearStandbyNeeded(socket.id)
+    streamRotationBubbleId.delete(socket.id)
+
+    const oldStream = streamingSessions.get(socket.id)
+    if (oldStream) {
+        speechToTextService.endStreamingRecognition(oldStream)
+    }
+    streamingSessions.delete(socket.id)
+
+    const conn = activeConnections.get(socket.id)
+    const sourceLanguage = conn?.sourceLanguage || 'en-CA'
+    const speechEndTimeout = conn?.speechEndTimeout ?? 1.0
+
+    try {
+        const newStream = await speechToTextService.startStreamingRecognition(
+            sourceLanguage,
+            speechEndTimeout,
+            createStreamCallbacks(socket)
+        )
+        if (newStream) {
+            streamingSessions.set(socket.id, newStream)
+        }
+    } catch (err) {
+        console.error('❌ performLazyStreamRotation failed:', err)
+    }
+
+    if (socket.connected) {
+        socket.emit('streamRestarted', {
+            newBubbleId: currentBubbleIds.get(socket.id) || null
+        })
+    }
+}
+
 io.on('connection', async (socket) => {
 
     // Log new connection
@@ -422,6 +614,7 @@ io.on('connection', async (socket) => {
                 streamingSessions.delete(socketId);
             }
             speechToTextService.cleanupStandbyStream(socketId);
+            streamRotationBubbleId.delete(socketId);
             activeConnections.delete(socketId);
             restartingStreams.delete(socketId);
             audioBufferDuringRestart.delete(socketId);
@@ -746,6 +939,7 @@ io.on('connection', async (socket) => {
                     streamingSessions.delete(socket.id);
                     // Clear any standby streams for this socket
                     speechToTextService.cleanupStandbyStream(socket.id);
+                    streamRotationBubbleId.delete(socket.id);
                     // Notify frontend that stream is restarting due to language change
                     socket.emit('streamRestart', {
                         reason: 'language_changed',
@@ -758,6 +952,7 @@ io.on('connection', async (socket) => {
             if (connection) {
                 connection.isStreaming = true
                 connection.sourceLanguage = sourceLanguage
+                connection.speechEndTimeout = speechEndTimeout
 
                 // Track streaming session start
                 if (!connection.streamStartTime) {
@@ -793,447 +988,11 @@ io.on('connection', async (socket) => {
                         if (!streamingSessions.has(socket.id)) {
 
                             try {
-                                const recognizeStream = await speechToTextService.startStreamingRecognition(sourceLanguage, speechEndTimeout, {
-                                    onResult: async (result) => {
-                                        // Use tracked bubbleId (updated by incoming audio) to handle stream restarts
-                                        const activeBubbleId = currentBubbleIds.get(socket.id) || bubbleId;
-
-                                        // Send transcription result to frontend (no filtering/duplicate removal)
-                                        socket.emit('transcriptionUpdate', {
-                                            transcript: result.transcript,
-                                            isFinal: result.isFinal,
-                                            confidence: result.confidence,
-                                            bubbleId: activeBubbleId
-                                        });
-
-                                        // Notify listeners when interim results come in
-                                        if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                                            notifyInterimTranscription(socket, sourceLanguage);
-                                        }
-
-                                        // Handle translation for final results
-                                        if (result.isFinal && result.transcript.trim()) {
-                                            // Stop typing indicator when final result comes in
-                                            const currentConnection = activeConnections.get(socket.id);
-                                            if (currentConnection?.userCode) {
-                                                const userCodeConnections = Array.from(activeConnections.entries())
-                                                    .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
-                                                    .map(([socketId, _]) => socketId);
-
-                                                const translationConnections = userCodeConnections.filter(socketId => {
-                                                    const conn = activeConnections.get(socketId);
-                                                    return conn && !conn.isStreaming && conn.targetLanguage;
-                                                });
-
-                                                translationConnections.forEach(socketId => {
-                                                    const targetSocket = io.sockets.sockets.get(socketId);
-                                                    if (targetSocket) {
-                                                        targetSocket.emit('speakerTyping', { isTyping: false });
-                                                    }
-                                                });
-
-                                                // Clear timeout
-                                                if (typingIndicatorTimeouts.has(socket.id)) {
-                                                    clearTimeout(typingIndicatorTimeouts.get(socket.id));
-                                                    typingIndicatorTimeouts.delete(socket.id);
-                                                }
-                                            }
-                                            // Notify frontend that we've received a final result
-                                            socket.emit('finalResultReceived', { bubbleId: activeBubbleId });
-
-                                            // Process final transcription (translation and delivery) - no duplicate filtering
-                                            await handleFinalTranscription(socket, result.transcript, sourceLanguage, activeBubbleId);
-                                        }
-                                    },
-                                    onError: (error) => {
-                                        console.error('❌ Google Cloud streaming error:', error);
-
-                                        // Attempt to recover from common errors
-                                        if (error.code === 14 || error.message.includes('UNAVAILABLE')) {
-                                            setTimeout(() => {
-                                                if (socket.connected) {
-                                                    socket.emit('streamRestart', {
-                                                        reason: 'recovery',
-                                                        error: error.message
-                                                    });
-                                                }
-                                            }, 1000);
-                                        }
-                                    },
-                                    onEnd: () => {
-                                        // Stream ended - this is normal with singleUtterance: true
-                                        // Clear the session so a new stream will be created when new audio arrives
-                                        streamingSessions.delete(socket.id);
-                                    },
-                                    // Create standby stream 1 minute before limit (called at 4 minutes)
-                                    onPreRestart: async () => {
-
-                                        const currentStream = streamingSessions.get(socket.id);
-                                        if (!currentStream) {
-                                            return;
-                                        }
-
-                                        try {
-                                            // Create standby stream (not receiving audio yet)
-                                            await speechToTextService.createStandbyStream(
-                                                socket.id,
-                                                sourceLanguage,
-                                                speechEndTimeout,
-                                                {
-                                                    onResult: async (result) => {
-                                                        // This will be used when standby is activated
-                                                        const activeBubbleId = currentBubbleIds.get(socket.id) || bubbleId;
-                                                        socket.emit('transcriptionUpdate', {
-                                                            transcript: result.transcript,
-                                                            isFinal: result.isFinal,
-                                                            confidence: result.confidence,
-                                                            bubbleId: activeBubbleId
-                                                        });
-
-                                                        // Notify listeners when interim results come in
-                                                        if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                                                            notifyInterimTranscription(socket, sourceLanguage);
-                                                        }
-
-                                                        if (result.isFinal && result.transcript.trim()) {
-                                                            // Stop typing indicator when final result comes in
-                                                            const currentConnection = activeConnections.get(socket.id);
-                                                            if (currentConnection?.userCode) {
-                                                                const userCodeConnections = Array.from(activeConnections.entries())
-                                                                    .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
-                                                                    .map(([socketId, _]) => socketId);
-
-                                                                const translationConnections = userCodeConnections.filter(socketId => {
-                                                                    const conn = activeConnections.get(socketId);
-                                                                    return conn && !conn.isStreaming && conn.targetLanguage;
-                                                                });
-
-                                                                translationConnections.forEach(socketId => {
-                                                                    const targetSocket = io.sockets.sockets.get(socketId);
-                                                                    if (targetSocket) {
-                                                                        targetSocket.emit('speakerTyping', { isTyping: false });
-                                                                    }
-                                                                });
-
-                                                                // Clear timeout
-                                                                if (typingIndicatorTimeouts.has(socket.id)) {
-                                                                    clearTimeout(typingIndicatorTimeouts.get(socket.id));
-                                                                    typingIndicatorTimeouts.delete(socket.id);
-                                                                }
-                                                            }
-                                                            // Notify frontend that we've received a final result
-                                                            socket.emit('finalResultReceived', { bubbleId: activeBubbleId });
-
-                                                            // Process final transcription (translation and delivery) - no duplicate filtering
-                                                            await handleFinalTranscription(socket, result.transcript, sourceLanguage, activeBubbleId);
-                                                        }
-                                                    },
-                                                    onError: (error) => {
-                                                        console.error('❌ Standby stream error:', error);
-                                                    },
-                                                    onEnd: () => {
-                                                    },
-                                                    // Standby streams don't need onPreRestart/onRestart - they become the active stream
-                                                    // and will get their own callbacks when activated
-                                                    onPreRestart: null,
-                                                    onRestart: null
-                                                }
-                                            );
-
-                                        } catch (error) {
-                                            console.error('❌ Failed to create standby stream:', error);
-                                        }
-                                    },
-                                    onError: (error) => {
-                                        console.error('❌ Google Cloud streaming error:', error);
-
-                                        // Attempt to recover from common errors
-                                        if (error.code === 14 || error.message.includes('UNAVAILABLE')) {
-                                            setTimeout(() => {
-                                                if (socket.connected) {
-                                                    socket.emit('streamRestart', {
-                                                        reason: 'recovery',
-                                                        error: error.message
-                                                    });
-                                                }
-                                            }, 1000);
-                                        }
-                                    },
-                                    onEnd: () => {
-                                        // Stream ended - this is normal with singleUtterance: true
-                                        // Clear the session so a new stream will be created when new audio arrives
-                                        streamingSessions.delete(socket.id);
-                                    },
-                                    // Create standby stream 1 minute before limit (called at 4 minutes)
-                                    onPreRestart: async () => {
-
-                                        const currentStream = streamingSessions.get(socket.id);
-                                        if (!currentStream) {
-                                            return;
-                                        }
-
-                                        // Check if standby already exists
-                                        if (speechToTextService.hasStandbyStream(socket.id)) {
-                                            return;
-                                        }
-
-                                        try {
-                                            // Create standby stream (not receiving audio yet)
-                                            await speechToTextService.createStandbyStream(
-                                                socket.id,
-                                                sourceLanguage,
-                                                speechEndTimeout,
-                                                {
-                                                    onResult: async (result) => {
-                                                        // This will be used when standby is activated
-                                                        const activeBubbleId = currentBubbleIds.get(socket.id) || bubbleId;
-                                                        socket.emit('transcriptionUpdate', {
-                                                            transcript: result.transcript,
-                                                            isFinal: result.isFinal,
-                                                            confidence: result.confidence,
-                                                            bubbleId: activeBubbleId
-                                                        });
-
-                                                        // Notify listeners when interim results come in
-                                                        if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                                                            notifyInterimTranscription(socket, sourceLanguage);
-                                                        }
-
-                                                        if (result.isFinal && result.transcript.trim()) {
-                                                            // Stop typing indicator when final result comes in
-                                                            const currentConnection = activeConnections.get(socket.id);
-                                                            if (currentConnection?.userCode) {
-                                                                const userCodeConnections = Array.from(activeConnections.entries())
-                                                                    .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
-                                                                    .map(([socketId, _]) => socketId);
-
-                                                                const translationConnections = userCodeConnections.filter(socketId => {
-                                                                    const conn = activeConnections.get(socketId);
-                                                                    return conn && !conn.isStreaming && conn.targetLanguage;
-                                                                });
-
-                                                                translationConnections.forEach(socketId => {
-                                                                    const targetSocket = io.sockets.sockets.get(socketId);
-                                                                    if (targetSocket) {
-                                                                        targetSocket.emit('speakerTyping', { isTyping: false });
-                                                                    }
-                                                                });
-
-                                                                // Clear timeout
-                                                                if (typingIndicatorTimeouts.has(socket.id)) {
-                                                                    clearTimeout(typingIndicatorTimeouts.get(socket.id));
-                                                                    typingIndicatorTimeouts.delete(socket.id);
-                                                                }
-                                                            }
-
-                                                            await handleFinalTranscription(socket, result.transcript, sourceLanguage, activeBubbleId);
-                                                        }
-                                                    },
-                                                    onError: (error) => {
-                                                        console.error('❌ Standby stream error:', error);
-                                                    },
-                                                    onEnd: () => {
-                                                    },
-                                                    // Standby streams don't need onPreRestart/onRestart - they become the active stream
-                                                    // and will get their own callbacks when activated
-                                                    onPreRestart: null,
-                                                    onRestart: null
-                                                }
-                                            );
-
-                                        } catch (error) {
-                                            console.error('❌ Failed to create standby stream:', error);
-                                        }
-                                    },
-                                    // Fallback restart (for error recovery)
-                                    onRestart: (async function restartStream() {
-
-                                        // Mark this socket as restarting to buffer incoming audio
-                                        restartingStreams.set(socket.id, true);
-                                        audioBufferDuringRestart.set(socket.id, []);
-
-                                        // Notify the speaker to save any displayed interim text
-                                        socket.emit('streamRestart', {
-                                            reason: '5-minute-limit-or-recovery',
-                                            timestamp: Date.now()
-                                        });
-
-                                        // Properly end current stream
-                                        if (recognizeStream) {
-                                            speechToTextService.endStreamingRecognition(recognizeStream);
-                                            recognizeStream.removeAllListeners();
-                                        }
-
-                                        // Clear the session mapping
-                                        streamingSessions.delete(socket.id);
-
-                                        // Clear any processed transcripts for this socket to prevent conflicts
-                                        const socketPrefix = `${socket.id}-`;
-                                        for (const [key, _] of processedTranscripts.entries()) {
-                                            if (key.startsWith(socketPrefix)) {
-                                                processedTranscripts.delete(key);
-                                            }
-                                        }
-
-                                        // Create new stream
-                                        const newRecognizeStream = await speechToTextService.startStreamingRecognition(sourceLanguage, speechEndTimeout, {
-                                            onResult: async (result) => {
-                                                // Use tracked bubbleId (updated by incoming audio) to handle stream restarts
-                                                const activeBubbleId = currentBubbleIds.get(socket.id) || bubbleId;
-
-                                                socket.emit('transcriptionUpdate', {
-                                                    transcript: result.transcript,
-                                                    isFinal: result.isFinal,
-                                                    confidence: result.confidence,
-                                                    bubbleId: activeBubbleId
-                                                });
-
-                                                // Notify listeners when interim results come in
-                                                if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                                                    notifyInterimTranscription(socket, sourceLanguage);
-                                                }
-
-                                                // Handle translation for final results
-                                                if (result.isFinal && result.transcript.trim()) {
-                                                    // Stop typing indicator when final result comes in
-                                                    const currentConnection = activeConnections.get(socket.id);
-                                                    if (currentConnection?.userCode) {
-                                                        const userCodeConnections = Array.from(activeConnections.entries())
-                                                            .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
-                                                            .map(([socketId, _]) => socketId);
-
-                                                        const translationConnections = userCodeConnections.filter(socketId => {
-                                                            const conn = activeConnections.get(socketId);
-                                                            return conn && !conn.isStreaming && conn.targetLanguage;
-                                                        });
-
-                                                        translationConnections.forEach(socketId => {
-                                                            const targetSocket = io.sockets.sockets.get(socketId);
-                                                            if (targetSocket) {
-                                                                targetSocket.emit('speakerTyping', { isTyping: false });
-                                                            }
-                                                        });
-
-                                                        // Clear timeout
-                                                        if (typingIndicatorTimeouts.has(socket.id)) {
-                                                            clearTimeout(typingIndicatorTimeouts.get(socket.id));
-                                                            typingIndicatorTimeouts.delete(socket.id);
-                                                        }
-                                                    }
-                                                    // Notify frontend that we've received a final result
-                                                    socket.emit('finalResultReceived', { bubbleId: activeBubbleId });
-
-                                                    if (currentConnection?.userCode) {
-                                                        const userCodeConnections = Array.from(activeConnections.entries())
-                                                            .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
-                                                            .map(([socketId, _]) => socketId);
-
-                                                        const translationConnections = userCodeConnections.filter(socketId => {
-                                                            const conn = activeConnections.get(socketId);
-                                                            return conn && !conn.isStreaming && conn.targetLanguage;
-                                                        });
-
-
-                                                        // Send transcription to input clients
-                                                        userCodeConnections.forEach(socketId => {
-                                                            const targetSocket = io.sockets.sockets.get(socketId);
-                                                            const conn = activeConnections.get(socketId);
-                                                            if (targetSocket && conn?.userId) {
-                                                                targetSocket.emit('transcriptionComplete', {
-                                                                    transcription: result.transcript,
-                                                                    sourceLanguage,
-                                                                    bubbleId: activeBubbleId,
-                                                                    userId: currentConnection.userId,
-                                                                    userEmail: currentConnection.userEmail
-                                                                });
-                                                            }
-                                                        });
-
-                                                        // Process translations
-                                                        if (translationConnections.length > 0) {
-                                                            try {
-                                                                const translations = await Promise.all(
-                                                                    translationConnections.map(async (socketId) => {
-                                                                        const conn = activeConnections.get(socketId);
-                                                                        if (conn?.targetLanguage) {
-                                                                            const translation = await processTranscription(
-                                                                                result.transcript,
-                                                                                sourceLanguage,
-                                                                                conn.targetLanguage
-                                                                            );
-                                                                            return { socketId, translation, targetLanguage: conn.targetLanguage };
-                                                                        }
-                                                                        return null;
-                                                                    })
-                                                                );
-
-                                                                translations.filter(Boolean).forEach(({ socketId, translation, targetLanguage }) => {
-                                                                    if (socketId && translation && messageQueue) {
-                                                                        messageQueue.queueMessage(socketId, {
-                                                                            originalText: result.transcript,
-                                                                            translatedText: translation,
-                                                                            sourceLanguage,
-                                                                            targetLanguage,
-                                                                            bubbleId: activeBubbleId
-                                                                        });
-                                                                    }
-                                                                });
-                                                            } catch (translationError) {
-                                                                console.error('Translation error:', translationError);
-                                                                translationConnections.forEach(socketId => {
-                                                                    const targetSocket = io.sockets.sockets.get(socketId);
-                                                                    if (targetSocket) {
-                                                                        targetSocket.emit('translationError', {
-                                                                            message: 'Translation failed: ' + translationError.message,
-                                                                            bubbleId: activeBubbleId
-                                                                        });
-                                                                    }
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                            onError: (error) => {
-                                                console.error('❌ Google Cloud streaming error:', error);
-
-                                                // Attempt to recover from common errors
-                                                if (error.code === 14 || error.message.includes('UNAVAILABLE')) {
-                                                    setTimeout(() => {
-                                                        if (socket.connected) {
-                                                            socket.emit('streamRestart', {
-                                                                reason: 'recovery',
-                                                                error: error.message
-                                                            });
-                                                        }
-                                                    }, 1000);
-                                                }
-                                            },
-                                            onEnd: () => {
-                                            },
-                                            onRestart: restartStream // Recursive restart
-                                        });
-
-                                        // Store new stream
-                                        if (newRecognizeStream) {
-                                            streamingSessions.set(socket.id, newRecognizeStream);
-
-                                            // Flush buffered audio to the new stream
-                                            const bufferedAudio = audioBufferDuringRestart.get(socket.id) || [];
-                                            if (bufferedAudio.length > 0) {
-                                                for (const audioBuffer of bufferedAudio) {
-                                                    speechToTextService.sendAudioToStream(newRecognizeStream, audioBuffer);
-                                                }
-                                            }
-
-                                            // Clear restart state
-                                            restartingStreams.delete(socket.id);
-                                            audioBufferDuringRestart.delete(socket.id);
-
-                                        }
-                                    }
-                                    )
-                                });
+                                const recognizeStream = await speechToTextService.startStreamingRecognition(
+                                    sourceLanguage,
+                                    speechEndTimeout,
+                                    createStreamCallbacks(socket)
+                                )
 
                                 // Store the stream for this socket
                                 if (recognizeStream) {
@@ -1419,6 +1178,7 @@ io.on('connection', async (socket) => {
 
         // Clean up any standby streams
         speechToTextService.cleanupStandbyStream(socket.id);
+        streamRotationBubbleId.delete(socket.id);
 
         // Clear restart state
         restartingStreams.delete(socket.id);
@@ -1542,6 +1302,7 @@ io.on('connection', async (socket) => {
 
         // Clean up any standby streams
         speechToTextService.cleanupStandbyStream(socket.id)
+        streamRotationBubbleId.delete(socket.id)
 
         // Clean up content hashes
         cleanupContentHashes(socket.id)
@@ -1604,6 +1365,7 @@ setInterval(() => {
                 streamingSessions.delete(socketId);
             }
             speechToTextService.cleanupStandbyStream(socketId);
+            streamRotationBubbleId.delete(socketId);
             restartingStreams.delete(socketId);
             audioBufferDuringRestart.delete(socketId);
             currentBubbleIds.delete(socketId);
@@ -1659,25 +1421,15 @@ function notifyInterimTranscription(socket, sourceLanguage) {
 
 // Helper function to handle final transcription processing (translation and delivery)
 async function handleFinalTranscription(socket, transcript, sourceLanguage, activeBubbleId) {
+    // Lazy rotation first so the new Google stream is ready before more audio arrives
+    if (speechToTextService.isStandbyNeeded(socket.id)) {
+        console.log(`🔄 [HANDOFF] Final transcription received, lazy-rotating stream for ${socket.id}`);
+        await performLazyStreamRotation(socket);
+    }
+
     // Accumulate the transcript
     const currentText = sessionTranscripts.get(socket.id) || '';
     sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + transcript);
-
-    // No duplicate filtering - process all final transcripts
-
-    // Check if we have a standby stream and switch to it now that transcription is finalized
-    if (speechToTextService.hasStandbyStream(socket.id)) {
-        console.log(`🔄 [HANDOFF] Final transcription received, switching to standby stream for ${socket.id}`);
-        const currentStream = streamingSessions.get(socket.id);
-        const newStream = speechToTextService.activateStandbyStream(socket.id, currentStream);
-
-        if (newStream) {
-            streamingSessions.set(socket.id, newStream);
-            console.log(`✅ [HANDOFF] Successfully switched to standby stream for ${socket.id}`);
-        } else {
-            console.error('❌ [HANDOFF] Failed to activate standby stream');
-        }
-    }
 
     const currentConnection = activeConnections.get(socket.id);
     if (!currentConnection?.userCode) return;
