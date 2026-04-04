@@ -36,13 +36,14 @@ const finalConfig = {
   CORS_ORIGIN: process.env.CORS_ORIGIN || config.CORS_ORIGIN,
   FRONTEND_URL: process.env.FRONTEND_URL || config.FRONTEND_URL,
   TRANSLATION_URL: process.env.TRANSLATION_URL || config.TRANSLATION_URL,
-  LOG_LEVEL: process.env.LOG_LEVEL || config.LOG_LEVEL
+  LOG_LEVEL: process.env.LOG_LEVEL || config.LOG_LEVEL,
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || config.GEMINI_API_KEY,
 };
 
 if (environment === 'prod') {
   const requiredVars = ['JWT_SECRET', 'CORS_ORIGIN', 'GOOGLE_CLOUD_PROJECT_ID'];
   const missingVars = requiredVars.filter(varName => !finalConfig[varName]);
-  
+
   if (missingVars.length > 0) {
     console.error(`Missing required environment variables for production: ${missingVars.join(', ')}`);
     process.exit(1);

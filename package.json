@@ -28,6 +28,8 @@
     "@google-cloud/speech": "^6.0.0",
     "@google-cloud/text-to-speech": "^6.4.0",
     "@google-cloud/translate": "^8.0.0",
+    "@google-cloud/vertexai": "^1.10.0",
+    "@google/generative-ai": "^0.24.1",
     "@sendgrid/mail": "^8.1.5",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
