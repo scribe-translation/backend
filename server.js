@@ -3,14 +3,11 @@ const http = require('http')
 const socketIo = require('socket.io')
 const cors = require('cors')
 const path = require('path')
-const crypto = require('crypto')
 require('dotenv').config()
 const config = require('./src/config')
-const { authenticateSocket, authenticateToken } = require('./src/middleware/auth')
+const { authenticateSocket } = require('./src/middleware/auth')
 const authRoutes = require('./src/routes/auth')
 const { initFirestore } = require('./src/database/firestore')
-const User = require('./src/models/User')
-const Session = require('./src/models/Session')
 const speechToTextService = require('./src/services/speechToTextService')
 const googleTranslationService = require('./src/services/googleTranslationService')
 const textToSpeechService = require('./src/services/textToSpeechService')
@@ -315,16 +312,16 @@ async function handleBackgroundProcessing(socketId, connectionData) {
     })();
 }
 
-const emitConnectionCount = (userCode = null) => {
+const emitConnectionCount = (sessionCode = null) => {
     const connectionsByLanguage = {}
     let totalConnections = 0
 
     activeConnections.forEach((connection) => {
-        if (userCode && connection.userCode !== userCode) {
+        if (sessionCode && connection.sessionCode !== sessionCode) {
             return
         }
 
-        if (!connection.userCode) {
+        if (!connection.sessionCode) {
             return
         }
 
@@ -339,13 +336,13 @@ const emitConnectionCount = (userCode = null) => {
         byLanguage: connectionsByLanguage
     }
 
-    if (userCode) {
-        const userCodeConnections = Array.from(activeConnections.entries())
-            .filter(([_, conn]) => conn.userCode === userCode)
+    if (sessionCode) {
+        const sessionCodeConnections = Array.from(activeConnections.entries())
+            .filter(([_, conn]) => conn.sessionCode === sessionCode)
             .map(([socketId, _]) => socketId)
 
 
-        userCodeConnections.forEach(socketId => {
+        sessionCodeConnections.forEach(socketId => {
             const targetSocket = io.sockets.sockets.get(socketId)
             if (targetSocket) {
                 targetSocket.emit('connectionCount', connectionData)
@@ -353,7 +350,7 @@ const emitConnectionCount = (userCode = null) => {
         })
     } else {
         const validConnections = Array.from(activeConnections.entries())
-            .filter(([_, conn]) => conn.userCode)
+            .filter(([_, conn]) => conn.sessionCode)
             .map(([socketId, _]) => socketId)
 
         validConnections.forEach(socketId => {
@@ -412,12 +409,12 @@ function createStreamCallbacks(socket) {
 
             if (result.isFinal && result.transcript.trim()) {
                 const currentConnection = activeConnections.get(socket.id)
-                if (currentConnection?.userCode) {
-                    const userCodeConnections = Array.from(activeConnections.entries())
-                        .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+                if (currentConnection?.sessionCode) {
+                    const sessionCodeConnections = Array.from(activeConnections.entries())
+                        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
                         .map(([socketId, _]) => socketId)
 
-                    const translationConnections = userCodeConnections.filter((sid) => {
+                    const translationConnections = sessionCodeConnections.filter((sid) => {
                         const conn = activeConnections.get(sid)
                         return conn && !conn.isStreaming && conn.targetLanguage
                     })
@@ -578,11 +575,11 @@ async function performLazyStreamRotation(socket) {
 io.on('connection', async (socket) => {
 
     // Log new connection
-    console.log(`🔗 New connection: ${socket.id} (user: ${socket.user?.email || 'listener'}, userCode: ${socket.userCode})`);
+    console.log(`🔗 New connection: ${socket.id} (user: ${socket.user?.email || 'listener'}, sessionCode: ${socket.sessionCode})`);
     console.log(`📊 Total connections before add: ${activeConnections.size}`);
 
     // Check for stale connections from same user and clean them up
-    // This handles both authenticated users (speakers) and listeners (userCode only)
+    // This handles both authenticated users (speakers) and listeners (sessionCode only)
     const staleConnections = [];
 
     activeConnections.forEach((conn, socketId) => {
@@ -591,10 +588,10 @@ io.on('connection', async (socket) => {
         // Check for same authenticated user (speaker)
         const isSameAuthUser = socket.user?.id && conn.userId === socket.user.id;
 
-        // Check for same listener (same userCode, both are listeners without userId)
-        // Note: We identify listeners as connections with userCode but no userId (or no isStreaming)
-        const isSameListener = !socket.user?.id && socket.userCode &&
-            conn.userCode === socket.userCode && !conn.userId;
+        // Check for same listener (same sessionCode, both are listeners without userId)
+        // Note: We identify listeners as connections with sessionCode but no userId (or no isStreaming)
+        const isSameListener = !socket.user?.id && socket.sessionCode &&
+            conn.sessionCode === socket.sessionCode && !conn.userId;
 
         if (isSameAuthUser || isSameListener) {
             // Check if the existing socket is actually disconnected
@@ -607,7 +604,7 @@ io.on('connection', async (socket) => {
 
     // Clean up stale connections immediately
     if (staleConnections.length > 0) {
-        const identifier = socket.user?.email || `listener-${socket.userCode}`;
+        const identifier = socket.user?.email || `listener-${socket.sessionCode}`;
         console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for ${identifier}`);
         staleConnections.forEach(socketId => {
             console.log(`  - Removing stale socket: ${socketId}`);
@@ -629,13 +626,13 @@ io.on('connection', async (socket) => {
             }
         });
         // Emit updated connection count immediately after cleanup
-        emitConnectionCount(socket.userCode);
+        emitConnectionCount(socket.sessionCode);
     }
 
     activeConnections.set(socket.id, {
         userId: socket.user?.id,
         userEmail: socket.user?.email,
-        userCode: socket.userCode,
+        sessionCode: socket.sessionCode,
         isStreaming: false,
         sourceLanguage: null,
         targetLanguage: null,
@@ -679,7 +676,7 @@ io.on('connection', async (socket) => {
         })
     }
 
-    emitConnectionCount(socket.userCode)
+    emitConnectionCount(socket.sessionCode)
 
     // Handle ping/pong for heartbeat
     socket.on('ping', () => {
@@ -814,19 +811,19 @@ io.on('connection', async (socket) => {
             }
 
             const currentConnection = activeConnections.get(socket.id)
-            emitConnectionCount(currentConnection?.userCode)
+            emitConnectionCount(currentConnection?.sessionCode)
 
-            if (currentConnection?.userCode) {
-                const userCodeConnections = Array.from(activeConnections.entries())
-                    .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+            if (currentConnection?.sessionCode) {
+                const sessionCodeConnections = Array.from(activeConnections.entries())
+                    .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
                     .map(([socketId, _]) => socketId)
 
-                const translationConnections = userCodeConnections.filter(socketId => {
+                const translationConnections = sessionCodeConnections.filter(socketId => {
                     const conn = activeConnections.get(socketId)
                     return conn && !conn.isStreaming && conn.targetLanguage
                 })
 
-                userCodeConnections.forEach(socketId => {
+                sessionCodeConnections.forEach(socketId => {
                     const targetSocket = io.sockets.sockets.get(socketId)
                     const conn = activeConnections.get(socketId)
                     if (targetSocket && conn?.userId) {
@@ -969,7 +966,7 @@ io.on('connection', async (socket) => {
             }
 
             const currentConnection = activeConnections.get(socket.id)
-            emitConnectionCount(currentConnection?.userCode)
+            emitConnectionCount(currentConnection?.sessionCode)
 
             // Track the current bubbleId from frontend (important for stream restarts)
             if (bubbleId) {
@@ -1060,17 +1057,17 @@ io.on('connection', async (socket) => {
 
             // Handle manual finalization (when frontend sends final transcript)
             if (finalTranscript && isFinal && !audioData) {
-                if (currentConnection?.userCode) {
-                    const userCodeConnections = Array.from(activeConnections.entries())
-                        .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+                if (currentConnection?.sessionCode) {
+                    const sessionCodeConnections = Array.from(activeConnections.entries())
+                        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
                         .map(([socketId, _]) => socketId)
 
-                    const translationConnections = userCodeConnections.filter(socketId => {
+                    const translationConnections = sessionCodeConnections.filter(socketId => {
                         const conn = activeConnections.get(socketId)
                         return conn && !conn.isStreaming && conn.targetLanguage
                     })
 
-                    userCodeConnections.forEach(socketId => {
+                    sessionCodeConnections.forEach(socketId => {
                         const targetSocket = io.sockets.sockets.get(socketId)
                         const conn = activeConnections.get(socketId)
                         if (targetSocket && conn?.userId) {
@@ -1199,7 +1196,7 @@ io.on('connection', async (socket) => {
         const connection = activeConnections.get(socket.id)
         if (connection) {
             connection.targetLanguage = data.targetLanguage
-            emitConnectionCount(connection.userCode)
+            emitConnectionCount(connection.sessionCode)
         }
     })
 
@@ -1234,17 +1231,17 @@ io.on('connection', async (socket) => {
 
     socket.on('getConnectionCount', () => {
         const currentConnection = activeConnections.get(socket.id)
-        const userCode = currentConnection?.userCode
+        const sessionCode = currentConnection?.sessionCode
 
         const connectionsByLanguage = {}
         let totalConnections = 0
 
         activeConnections.forEach((connection) => {
-            if (userCode && connection.userCode !== userCode) {
+            if (sessionCode && connection.sessionCode !== sessionCode) {
                 return
             }
 
-            if (!connection.userCode) {
+            if (!connection.sessionCode) {
                 return
             }
 
@@ -1343,7 +1340,7 @@ io.on('connection', async (socket) => {
 
         console.log(`📊 Total connections after remove: ${activeConnections.size}`)
 
-        emitConnectionCount(connection?.userCode)
+        emitConnectionCount(connection?.sessionCode)
     })
 })
 
@@ -1391,13 +1388,13 @@ setInterval(() => {
 
 async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
     const currentConnection = activeConnections.get(socket.id);
-    if (!currentConnection?.userCode) return;
+    if (!currentConnection?.sessionCode) return;
 
-    const userCodeConnections = Array.from(activeConnections.entries())
-        .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+    const sessionCodeConnections = Array.from(activeConnections.entries())
+        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
         .map(([socketId, _]) => socketId);
 
-    const translationConnections = userCodeConnections.filter(socketId => {
+    const translationConnections = sessionCodeConnections.filter(socketId => {
         const conn = activeConnections.get(socketId);
         return conn && !conn.isStreaming && conn.targetLanguage;
     });
@@ -1501,20 +1498,20 @@ async function handleFinalTranscription(socket, transcript, sourceLanguage, acti
     sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + transcript);
 
     const currentConnection = activeConnections.get(socket.id);
-    if (!currentConnection?.userCode) return;
+    if (!currentConnection?.sessionCode) return;
 
-    const userCodeConnections = Array.from(activeConnections.entries())
-        .filter(([_, conn]) => conn.userCode === currentConnection.userCode)
+    const sessionCodeConnections = Array.from(activeConnections.entries())
+        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
         .map(([socketId, _]) => socketId);
 
-    const translationConnections = userCodeConnections.filter(socketId => {
+    const translationConnections = sessionCodeConnections.filter(socketId => {
         const conn = activeConnections.get(socketId);
         return conn && !conn.isStreaming && conn.targetLanguage;
     });
 
 
     // Send transcription to input clients
-    userCodeConnections.forEach(socketId => {
+    sessionCodeConnections.forEach(socketId => {
         const targetSocket = io.sockets.sockets.get(socketId);
         const conn = activeConnections.get(socketId);
         if (targetSocket && conn?.userId) {
@@ -1708,8 +1705,6 @@ const startServer = async () => {
         console.log(`🌐 Port: ${config.PORT}`)
         console.log(`🏠 Host: ${config.HOST}`)
 
-        // Start listening on the port FIRST to satisfy Cloud Run health checks
-        // This ensures the container responds to health checks quickly
         await new Promise((resolve, reject) => {
             server.listen(config.PORT, config.HOST, () => {
                 console.log(`🚀 Server listening on ${config.HOST}:${config.PORT}`)
@@ -1727,7 +1722,6 @@ const startServer = async () => {
             console.log('⚠️ Server will continue but database features may not work')
         }
 
-        // Initialize Google Cloud client in the background to avoid startup delays
         try {
             await speechToTextService.getSpeechClient()
             console.log('✅ Google Cloud Speech client initialized')
@@ -1736,20 +1730,15 @@ const startServer = async () => {
             console.log('⚠️ Continuing without Google Cloud Speech (transcription will not work)')
         }
 
-        // Set up periodic cleanup to prevent memory leaks
         setInterval(() => {
             const now = Date.now()
-
-            // Clean up old processed transcripts (older than 10 minutes)
             for (const [key, timestamp] of processedTranscripts.entries()) {
                 if (now - timestamp > 10 * 60 * 1000) {
                     processedTranscripts.delete(key)
                 }
             }
-
-            // Log connection statistics
             console.log(`📊 Active connections: ${activeConnections.size}, Processed transcripts: ${processedTranscripts.size}`)
-        }, 5 * 60 * 1000) // Run every 5 minutes
+        }, 5 * 60 * 1000)
 
         console.log('✅ Server is ready to accept connections')
     } catch (error) {
@@ -1758,20 +1747,15 @@ const startServer = async () => {
     }
 }
 
-process.on('SIGTERM', () => {
-    console.log('🛑 Received SIGTERM, shutting down gracefully...');
+const gracefulShutdown = (signal) => {
+    console.log(`🛑 Received ${signal}, shutting down gracefully...`)
     server.close(() => {
-        console.log('✅ Server closed');
-        process.exit(0);
-    });
-});
+        console.log('✅ Server closed')
+        process.exit(0)
+    })
+}
 
-process.on('SIGINT', () => {
-    console.log('🛑 Received SIGINT, shutting down gracefully...');
-    server.close(() => {
-        console.log('✅ Server closed');
-        process.exit(0);
-    });
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 startServer()

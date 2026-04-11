@@ -36,6 +36,19 @@ const validateLogin = [
     .withMessage('Password is required')
 ];
 
+router.get('/session-code', authenticateToken, handleGetSessionCode);
+router.get('/user-code', authenticateToken, handleGetSessionCode);
+router.get('/user-by-session-code', handleGetUserBySessionCode);
+router.get('/user-by-code', handleGetUserBySessionCode);
+
+router.post('/generate-session-code', authenticateToken, handleGenerateSessionCode);
+router.post('/generate-user-code', authenticateToken, handleGenerateSessionCode);
+router.post('/set-session-code', authenticateToken, setSessionCodeValidation, handleSetSessionCode);
+router.post('/set-user-code', authenticateToken, setSessionCodeValidation, handleSetSessionCode);
+
+router.delete('/session-code', authenticateToken, handleClearSessionCode);
+router.delete('/user-code', authenticateToken, handleClearSessionCode);
+
 /**
  * @route   POST /api/auth/register
  * @desc    Register a new user
@@ -70,14 +83,12 @@ router.post('/register', validateRegistration, async (req, res) => {
     const finalPasswordHash = `${hashedPassword}:${salt}`;
     const user = await User.create(name, email, finalPasswordHash);
 
-    // Automatically generate a user code for new users
-    let userCode = null;
+    let sessionCode = null;
     try {
-      userCode = await User.generateUserCode();
-      await User.setUserCode(user.id, userCode);
+      sessionCode = await User.generateSessionCode();
+      await User.setSessionCode(user.id, sessionCode);
     } catch (error) {
-      console.error('Failed to generate user code for new user:', error);
-      // Continue without user code - user can generate one later
+      console.error('Failed to generate session code for new user:', error);
     }
 
     const accessToken = generateToken(user);
@@ -89,7 +100,8 @@ router.post('/register', validateRegistration, async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        userCode: userCode,
+        sessionCode: sessionCode,
+        userCode: sessionCode, // backward compat
         createdAt: user.createdAt
       },
       tokens: {
@@ -159,15 +171,13 @@ router.post('/login', validateLogin, async (req, res) => {
       }
     }
 
-    // Ensure user has a code - generate one if they don't
-    let userCode = user.userCode;
-    if (!userCode) {
+    let sessionCode = user.sessionCode;
+    if (!sessionCode) {
       try {
-        userCode = await User.generateUserCode();
-        await User.setUserCode(user.id, userCode);
+        sessionCode = await User.generateSessionCode();
+        await User.setSessionCode(user.id, sessionCode);
       } catch (error) {
-        console.error('Failed to generate user code for existing user:', error);
-        // Continue without user code - user can generate one later
+        console.error('Failed to generate session code for existing user:', error);
       }
     }
 
@@ -180,7 +190,8 @@ router.post('/login', validateLogin, async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        userCode: userCode,
+        sessionCode: sessionCode,
+        userCode: sessionCode, // backward compat
         createdAt: user.createdAt,
         totpEnabled: user.totpEnabled,
         totalSessions: user.totalSessions || 0,
@@ -266,7 +277,6 @@ router.post('/logout', authenticateToken, (req, res) => {
  */
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    // Get fresh user data including user code
     const user = await User.findUserById(req.user.id);
     if (!user) {
       return res.status(404).json({
@@ -280,7 +290,8 @@ router.get('/me', authenticateToken, async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        userCode: user.userCode,
+        sessionCode: user.sessionCode,
+        userCode: user.sessionCode, // backward compat
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         totpEnabled: user.totpEnabled,
@@ -788,11 +799,12 @@ router.get('/verify-reset-token', async (req, res) => {
 });
 
 /**
- * @route   GET /api/auth/user-code
- * @desc    Get current user's code
+ * @route   GET /api/auth/session-code
+ * @route   GET /api/auth/user-code (backward compat)
+ * @desc    Get current user's session code
  * @access  Private
  */
-router.get('/user-code', authenticateToken, async (req, res) => {
+const handleGetSessionCode = async (req, res) => {
   try {
     const user = await User.findUserById(req.user.id);
     if (!user) {
@@ -803,60 +815,60 @@ router.get('/user-code', authenticateToken, async (req, res) => {
     }
 
     res.json({
-      userCode: user.userCode,
-      hasCode: !!user.userCode
+      sessionCode: user.sessionCode,
+      userCode: user.sessionCode, // backward compat
+      hasCode: !!user.sessionCode
     });
 
   } catch (error) {
-    console.error('Get user code error:', error.message);
+    console.error('Get session code error:', error.message);
     res.status(500).json({
-      error: 'Failed to get user code',
+      error: 'Failed to get session code',
       message: error.message
     });
   }
-});
+};
 
 /**
- * @route   POST /api/auth/generate-user-code
- * @desc    Generate a new user code for the current user
+ * @route   POST /api/auth/generate-session-code
+ * @route   POST /api/auth/generate-user-code (backward compat)
+ * @desc    Generate a new session code for the current user
  * @access  Private
  */
-router.post('/generate-user-code', authenticateToken, async (req, res) => {
+const handleGenerateSessionCode = async (req, res) => {
   try {
     const userId = req.user.id;
     
-    // Generate a new unique user code
-    const userCode = await User.generateUserCode();
-    
-    // Set the code for the user
-    await User.setUserCode(userId, userCode);
+    const sessionCode = await User.generateSessionCode();
+    await User.setSessionCode(userId, sessionCode);
 
     res.json({
-      message: 'User code generated successfully',
-      userCode
+      message: 'Session code generated successfully',
+      sessionCode,
+      userCode: sessionCode, // backward compat
     });
 
   } catch (error) {
-    console.error('Generate user code error:', error.message);
+    console.error('Generate session code error:', error.message);
     res.status(500).json({
-      error: 'Failed to generate user code',
+      error: 'Failed to generate session code',
       message: error.message
     });
   }
-});
+};
 
 /**
- * @route   POST /api/auth/set-user-code
- * @desc    Set a custom user code for the current user
+ * @route   POST /api/auth/set-session-code
+ * @route   POST /api/auth/set-user-code (backward compat)
+ * @desc    Set a custom session code for the current user
  * @access  Private
  */
-router.post('/set-user-code', authenticateToken, [
-  body('userCode')
-    .isLength({ min: 3, max: 8 })
-    .withMessage('User code must be between 3 and 8 characters')
-    .matches(/^[A-Z0-9]+$/)
-    .withMessage('User code must contain only uppercase letters and numbers')
-], async (req, res) => {
+const setSessionCodeValidation = [
+  body('sessionCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
+  body('userCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
+];
+
+const handleSetSessionCode = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -866,75 +878,82 @@ router.post('/set-user-code', authenticateToken, [
       });
     }
 
-    const { userCode } = req.body;
+    const sessionCode = req.body.sessionCode || req.body.userCode;
+    if (!sessionCode) {
+      return res.status(400).json({
+        error: 'Session code is required',
+        code: 'MISSING_SESSION_CODE'
+      });
+    }
+
     const userId = req.user.id;
-    
-    // Set the custom user code
-    await User.setUserCode(userId, userCode);
+    await User.setSessionCode(userId, sessionCode);
 
     res.json({
-      message: 'User code set successfully',
-      userCode
+      message: 'Session code set successfully',
+      sessionCode,
+      userCode: sessionCode, // backward compat
     });
 
   } catch (error) {
-    console.error('Set user code error:', error.message);
+    console.error('Set session code error:', error.message);
     
-    if (error.message === 'User code is already taken') {
+    if (error.message === 'Session code is already taken') {
       return res.status(409).json({
-        error: 'User code is already taken',
+        error: 'Session code is already taken',
         code: 'CODE_TAKEN'
       });
     }
     
     res.status(500).json({
-      error: 'Failed to set user code',
+      error: 'Failed to set session code',
       message: error.message
     });
   }
-});
+};
 
 /**
- * @route   DELETE /api/auth/user-code
- * @desc    Clear the current user's code
+ * @route   DELETE /api/auth/session-code
+ * @route   DELETE /api/auth/user-code (backward compat)
+ * @desc    Clear the current user's session code
  * @access  Private
  */
-router.delete('/user-code', authenticateToken, async (req, res) => {
+const handleClearSessionCode = async (req, res) => {
   try {
     const userId = req.user.id;
-    
-    await User.clearUserCode(userId);
+    await User.clearSessionCode(userId);
 
     res.json({
-      message: 'User code cleared successfully'
+      message: 'Session code cleared successfully'
     });
 
   } catch (error) {
-    console.error('Clear user code error:', error.message);
+    console.error('Clear session code error:', error.message);
     res.status(500).json({
-      error: 'Failed to clear user code',
+      error: 'Failed to clear session code',
       message: error.message
     });
   }
-});
+};
 
 /**
- * @route   GET /api/auth/user-by-code
- * @desc    Get user information by user code
+ * @route   GET /api/auth/user-by-session-code
+ * @route   GET /api/auth/user-by-code (backward compat)
+ * @desc    Get user information by session code
  * @access  Public
  */
-router.get('/user-by-code', async (req, res) => {
+const handleGetUserBySessionCode = async (req, res) => {
   try {
     const { code } = req.query;
 
     if (!code) {
       return res.status(400).json({
-        error: 'User code is required',
-        code: 'MISSING_USER_CODE'
+        error: 'Session code is required',
+        code: 'MISSING_SESSION_CODE'
       });
     }
 
-    const user = await User.findUserByCode(code);
+    const user = await User.findUserBySessionCode(code);
     if (!user) {
       return res.status(404).json({
         error: 'User not found for this code',
@@ -947,18 +966,19 @@ router.get('/user-by-code', async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
-        userCode: user.userCode
+        sessionCode: user.sessionCode,
+        userCode: user.sessionCode, // backward compat
       }
     });
 
   } catch (error) {
-    console.error('Get user by code error:', error.message);
+    console.error('Get user by session code error:', error.message);
     res.status(500).json({
-      error: 'Failed to get user by code',
+      error: 'Failed to get user by session code',
       message: error.message
     });
   }
-});
+};
 
 /**
  * @route   GET /api/auth/connection-info
@@ -968,25 +988,22 @@ router.get('/user-by-code', async (req, res) => {
 router.get('/connection-info', authenticateToken, async (req, res) => {
   try {
     const user = await User.findUserById(req.user.id);
-    if (!user || !user.userCode) {
+    if (!user || !user.sessionCode) {
       return res.status(404).json({
-        error: 'User code not found',
-        code: 'NO_USER_CODE'
+        error: 'Session code not found',
+        code: 'NO_SESSION_CODE'
       });
     }
 
-    // Get the translation URL from config
     const translationUrl = config.TRANSLATION_URL || `${req.protocol}://${req.get('host')}`;
-
-    // Generate connection URL for listeners
-    const connectionUrl = `${translationUrl}?code=${user.userCode}`;
+    const connectionUrl = `${translationUrl}?code=${user.sessionCode}`;
     
-    // Generate QR code data URL
     const QRCode = require('qrcode');
     const qrCodeUrl = await QRCode.toDataURL(connectionUrl);
 
     res.json({
-      userCode: user.userCode,
+      sessionCode: user.sessionCode,
+      userCode: user.sessionCode, // backward compat
       connectionUrl,
       qrCodeUrl,
       shareText: `Join my Scribe session: ${connectionUrl}`

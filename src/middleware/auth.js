@@ -51,32 +51,33 @@ const authenticateToken = (req, res, next) => {
 
 /**
  * Middleware to authenticate WebSocket connections
- * Supports both JWT authentication and user code-based connections
+ * Supports both JWT authentication and session code-based connections
+ * Accepts both auth.sessionCode and auth.userCode for backward compat
  */
 const authenticateSocket = async (socket, next) => {
   const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
-  const userCode = socket.handshake.auth.userCode;
+  const sessionCode = socket.handshake.auth.sessionCode || socket.handshake.auth.userCode;
 
-  if (userCode) {
-    // Validate user code format (3-8 characters, alphanumeric)
-    if (!/^[A-Z0-9]{3,8}$/.test(userCode)) {
-      console.log(`❌ Invalid user code format: ${userCode}`);
-      return next(new Error('Invalid user code format'));
+  if (sessionCode) {
+    if (!/^[A-Z0-9]{3,8}$/.test(sessionCode)) {
+      console.log(`❌ Invalid session code format: ${sessionCode}`);
+      return next(new Error('Invalid session code format'));
     }
     
     try {
-      const user = await User.findUserByCode(userCode);
+      const user = await User.findUserBySessionCode(sessionCode);
       if (!user) {
-        console.log(`❌ User not found for code: ${userCode}`);
-        return next(new Error('User not found for this code'));
+        console.log(`❌ User not found for session code: ${sessionCode}`);
+        return next(new Error('User not found for this session code'));
       }
       
-      socket.userCode = userCode;
+      socket.sessionCode = sessionCode;
+      socket.userCode = sessionCode; // backward compat for server.js
       socket.user = user;
       socket.needsTokenRefresh = false;
     } catch (error) {
-      console.error('Error validating user code:', error);
-      return next(new Error('User code validation failed'));
+      console.error('Error validating session code:', error);
+      return next(new Error('Session code validation failed'));
     }
   }
 
@@ -84,7 +85,7 @@ const authenticateSocket = async (socket, next) => {
     jwt.verify(token, JWT_SECRET, async (err, decoded) => {
       if (err) {
         if (err.name === 'TokenExpiredError') {
-          console.log('🔄 Token expired, allowing connection with user code-only mode');
+          console.log('🔄 Token expired, allowing connection with session code-only mode');
           socket.user = null;
           socket.needsTokenRefresh = true;
           return next();
@@ -108,11 +109,10 @@ const authenticateSocket = async (socket, next) => {
         return next(new Error('Authentication failed'));
       }
     });
-  } else if (userCode) {
-    // User code authentication successful
+  } else if (sessionCode) {
     next();
   } else {
-    return next(new Error('Authentication token or user code required'));
+    return next(new Error('Authentication token or session code required'));
   }
 };
 

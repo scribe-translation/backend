@@ -9,7 +9,7 @@ class User {
     this.email = data.email;
     this.passwordHash = data.passwordHash || data.password_hash;
     this.isActive = data.isActive !== undefined ? data.isActive : data.is_active;
-    this.userCode = data.userCode || data.user_code;
+    this.sessionCode = data.sessionCode || data.session_code || data.userCode || data.user_code;
     this.totpSecret = data.totpSecret || data.totp_secret;
     this.totpEnabled = data.totpEnabled !== undefined ? data.totpEnabled : data.totp_enabled;
     this.totpBackupCodes = data.totpBackupCodes || data.totp_backup_codes;
@@ -33,7 +33,7 @@ class User {
         email,
         passwordHash: hashedPassword,
         isActive: true,
-        userCode: null,
+        sessionCode: null,
         totpSecret: null,
         totpEnabled: false,
         totpBackupCodes: null,
@@ -264,7 +264,7 @@ class User {
     }
   }
 
-  static async generateUserCode() {
+  static async generateSessionCode() {
     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let code;
     let isUnique = false;
@@ -275,16 +275,14 @@ class User {
     const usersRef = db.collection(Collections.USERS);
 
     while (!isUnique && attempts < maxAttempts) {
-      // Generate a random code between 3-8 characters
-      const length = Math.floor(Math.random() * 6) + 3; // 3-8 characters
+      const length = Math.floor(Math.random() * 6) + 3;
       code = '';
       for (let i = 0; i < length; i++) {
         code += characters.charAt(Math.floor(Math.random() * characters.length));
       }
 
-      // Check if code is unique
       const snapshot = await usersRef
-        .where('userCode', '==', code)
+        .where('sessionCode', '==', code)
         .limit(1)
         .get();
 
@@ -295,19 +293,19 @@ class User {
     }
 
     if (!isUnique) {
-      throw new Error('Unable to generate unique user code after maximum attempts');
+      throw new Error('Unable to generate unique session code after maximum attempts');
     }
 
     return code;
   }
 
-  static async findUserByCode(userCode) {
+  static async findUserBySessionCode(sessionCode) {
     try {
       const db = getDb();
       const usersRef = db.collection(Collections.USERS);
       
       const snapshot = await usersRef
-        .where('userCode', '==', userCode)
+        .where('sessionCode', '==', sessionCode)
         .where('isActive', '==', true)
         .limit(1)
         .get();
@@ -322,60 +320,58 @@ class User {
         ...doc.data(),
       });
     } catch (error) {
-      console.error('Error finding user by code:', error);
+      console.error('Error finding user by session code:', error);
       throw error;
     }
   }
 
-  static async setUserCode(userId, userCode) {
+  static async setSessionCode(userId, sessionCode) {
     try {
-      // Validate user code format
-      if (!userCode || userCode.length < 3 || userCode.length > 8) {
-        throw new Error('User code must be between 3 and 8 characters');
+      if (!sessionCode || sessionCode.length < 3 || sessionCode.length > 8) {
+        throw new Error('Session code must be between 3 and 8 characters');
       }
 
       const db = getDb();
       const usersRef = db.collection(Collections.USERS);
 
-      // Check if code is already taken by another user
       const snapshot = await usersRef
-        .where('userCode', '==', userCode)
+        .where('sessionCode', '==', sessionCode)
         .limit(1)
         .get();
 
       if (!snapshot.empty) {
         const existingDoc = snapshot.docs[0];
         if (existingDoc.id !== userId) {
-          throw new Error('User code is already taken');
+          throw new Error('Session code is already taken');
         }
       }
 
       const docRef = usersRef.doc(userId);
       await docRef.update({
-        userCode,
+        sessionCode,
         updatedAt: dateToTimestamp(new Date()),
       });
 
       return true;
     } catch (error) {
-      console.error('Error setting user code:', error);
+      console.error('Error setting session code:', error);
       throw error;
     }
   }
 
-  static async clearUserCode(userId) {
+  static async clearSessionCode(userId) {
     try {
       const db = getDb();
       const docRef = db.collection(Collections.USERS).doc(userId);
       
       await docRef.update({
-        userCode: null,
+        sessionCode: null,
         updatedAt: dateToTimestamp(new Date()),
       });
 
       return true;
     } catch (error) {
-      console.error('Error clearing user code:', error);
+      console.error('Error clearing session code:', error);
       throw error;
     }
   }
@@ -475,7 +471,8 @@ class User {
       name: this.name,
       email: this.email,
       isActive: this.isActive,
-      userCode: this.userCode,
+      sessionCode: this.sessionCode,
+      userCode: this.sessionCode, // backward compat for old frontend
       totpEnabled: this.totpEnabled,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
