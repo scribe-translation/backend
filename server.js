@@ -407,7 +407,7 @@ function createStreamCallbacks(socket) {
             })
 
             if (!result.isFinal && result.transcript && result.transcript.trim()) {
-                notifyInterimTranscription(socket, sourceLanguage, result.transcript.trim())
+                await notifyInterimTranscription(socket, sourceLanguage, result.transcript.trim())
             }
 
             if (result.isFinal && result.transcript.trim()) {
@@ -1375,6 +1375,11 @@ setInterval(() => {
             restartingStreams.delete(socketId);
             audioBufferDuringRestart.delete(socketId);
             currentBubbleIds.delete(socketId);
+            interimTranslationThrottle.delete(socketId);
+            if (typingIndicatorTimeouts.has(socketId)) {
+                clearTimeout(typingIndicatorTimeouts.get(socketId));
+                typingIndicatorTimeouts.delete(socketId);
+            }
             activeConnections.delete(socketId);
         });
 
