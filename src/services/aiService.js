@@ -53,15 +53,16 @@ class AiService {
     }
 
     try {
-      const prompt = `Please provide a concise, high-level summary of the following sermon or speech transcription. Focus on the main themes and key takeaways. Keep it to 2-3 paragraphs maximum.
-      
+      const prompt = `Please provide a concise, high-level summary of the following session transcription. Keep it to 2-3 paragraphs maximum.
+
       CRITICAL INSTRUCTIONS:
-      - Ground the summary in Scripture: Always include or reference key Bible verses mentioned in the transcription to provide a solid Biblical basis. 📖
+      - First, identify the type of content (e.g., sermon, Bible study, lecture, meeting, workshop, speech) and tailor the summary to match its context.
+      - If the content is religious in nature, ground the summary in relevant Scripture references mentioned in the transcription. 📖
+      - Focus on the main themes and key takeaways.
       - Always provide a summary or your best attempt at extracting the meaning, even if the text is extremely short or a single sentence.
-      - DO NOT state that the text is not a sermon or speech.
       - DO NOT state that a summary cannot be provided.
       - DO NOT include any conversational filler, meta-commentary, or explanations. Just output the summary.
-      
+
       Transcription:\n${text}`;
 
       const result = await this.model.generateContent(prompt);
@@ -85,21 +86,23 @@ class AiService {
     }
 
     try {
-      const prompt = `You are a social media manager for a church. Write exactly ONE engaging, comprehensive, and inspiring Facebook post based on the following sermon transcription. 
-      
+      const prompt = `You are a social media manager for an organization. Write exactly ONE engaging, comprehensive, and inspiring Facebook post based on the following session transcription.
+
+      First, identify the type of content (e.g., sermon, Bible study, lecture, meeting, workshop, speech) and tailor the post to match its context and tone.
+
       The post structure should include:
       - An attention-grabbing hook or inspiring thought at the very beginning. ✨
       - A section called "Key Takeaways" or similar, using bullet points (e.g., • or -) to make the message easy to read on mobile. 📱
-      - Relevant Scripture: Always include or reference key Bible verses mentioned in the transcription (or very relevant ones if none are explicit). 📖
-      - Generous use of relevant emojis throughout to break up text and add personality. 🙏✨🕊️
+      - If the content is religious in nature, include or reference key Scripture mentioned in the transcription. 📖
+      - Generous use of relevant emojis throughout to break up text and add personality.
       - A strong Call to Action (CTA) at the end: Ask a thoughtful question, encourage people to share the post, or invite them to reflect. 💬
-      
+
       CRITICAL INSTRUCTIONS:
       - ALWAYS provide exactly ONE post option. Do NOT provide alternatives.
       - DO NOT include any instructions, placeholders (like "[Link here]"), meta-commentary, notes, or tips.
       - DO NOT explain your choices. Output ONLY the raw text for the Facebook post itself, ready to be copied and pasted.
       - Ensure the tone is warm, inviting, and grounded in the provided transcription.
-      
+
       Transcription:\n${text}`;
 
       const result = await this.model.generateContent(prompt);
