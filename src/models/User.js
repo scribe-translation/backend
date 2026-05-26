@@ -3,13 +3,18 @@ const { getDb, Collections, timestampToDate, dateToTimestamp } = require('../dat
 const { FieldValue } = require('@google-cloud/firestore');
 
 class User {
+  /** Canonical Firestore field for listener join codes. */
+  static SESSION_CODE_FIELD = 'sessionCode';
+  /** Legacy field — removed on read/write; kept only for migration queries. */
+  static LEGACY_USER_CODE_FIELD = 'userCode';
+
   constructor(data) {
     this.id = data.id;
     this.name = data.name;
     this.email = data.email;
     this.passwordHash = data.passwordHash || data.password_hash;
     this.isActive = data.isActive !== undefined ? data.isActive : data.is_active;
-    this.userCode = data.userCode || data.user_code;
+    this.sessionCode = User.resolveSessionCodeFromData(data);
     this.totpSecret = data.totpSecret || data.totp_secret;
     this.totpEnabled = data.totpEnabled !== undefined ? data.totpEnabled : data.totp_enabled;
     this.totpBackupCodes = data.totpBackupCodes || data.totp_backup_codes;
@@ -18,6 +23,81 @@ class User {
     this.totalUsageMinutes = data.totalUsageMinutes || 0;
     this.totalSessions = data.totalSessions || 0;
     this.lastActiveAt = timestampToDate(data.lastActiveAt);
+  }
+
+  static resolveSessionCodeFromData(data) {
+    const raw =
+      data.sessionCode ??
+      data.session_code ??
+      data.userCode ??
+      data.user_code;
+    if (raw == null || raw === '') return null;
+    return String(raw).trim().toUpperCase();
+  }
+
+  static normalizeSessionCode(sessionCode) {
+    return String(sessionCode).trim().toUpperCase();
+  }
+
+  /** Drop legacy userCode fields whenever we persist sessionCode. */
+  static legacySessionCodeFieldDeletes() {
+    return {
+      userCode: FieldValue.delete(),
+      user_code: FieldValue.delete(),
+    };
+  }
+
+  /**
+   * If a document still has userCode, copy it to sessionCode and delete userCode.
+   */
+  static async syncLegacySessionCodeField(docRef, data) {
+    const legacy = data.userCode ?? data.user_code;
+    const hasLegacy = legacy != null && legacy !== '';
+
+    if (!hasLegacy) {
+      return data;
+    }
+
+    const resolved = User.resolveSessionCodeFromData(data);
+    const updates = {
+      ...User.legacySessionCodeFieldDeletes(),
+      updatedAt: dateToTimestamp(new Date()),
+    };
+
+    if (resolved) {
+      updates.sessionCode = resolved;
+    }
+
+    await docRef.update(updates);
+    return {
+      ...data,
+      sessionCode: resolved ?? data.sessionCode,
+      userCode: undefined,
+      user_code: undefined,
+    };
+  }
+
+  static async hydrateUserDoc(doc) {
+    const data = doc.data();
+    const synced = await User.syncLegacySessionCodeField(doc.ref, data);
+    return new User({ id: doc.id, ...synced });
+  }
+
+  static async isSessionCodeTaken(sessionCode, excludeUserId = null) {
+    const normalized = User.normalizeSessionCode(sessionCode);
+    const db = getDb();
+    const usersRef = db.collection(Collections.USERS);
+
+    for (const field of [User.SESSION_CODE_FIELD, User.LEGACY_USER_CODE_FIELD]) {
+      const snapshot = await usersRef.where(field, '==', normalized).limit(1).get();
+      if (!snapshot.empty) {
+        const existingId = snapshot.docs[0].id;
+        if (!excludeUserId || existingId !== excludeUserId) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   static async create(name, email, password) {
@@ -33,7 +113,7 @@ class User {
         email,
         passwordHash: hashedPassword,
         isActive: true,
-        userCode: null,
+        sessionCode: null,
         totpSecret: null,
         totpEnabled: false,
         totpBackupCodes: null,
@@ -76,10 +156,7 @@ class User {
       }
 
       const doc = snapshot.docs[0];
-      return new User({
-        id: doc.id,
-        ...doc.data(),
-      });
+      return User.hydrateUserDoc(doc);
     } catch (error) {
       console.error('Error finding user by email:', error);
       throw error;
@@ -101,10 +178,7 @@ class User {
         return null;
       }
 
-      return new User({
-        id: doc.id,
-        ...data,
-      });
+      return User.hydrateUserDoc(doc);
     } catch (error) {
       console.error('Error finding user by ID:', error);
       throw error;
@@ -264,7 +338,7 @@ class User {
     }
   }
 
-  static async generateUserCode() {
+  static async generateSessionCode() {
     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let code;
     let isUnique = false;
@@ -275,107 +349,97 @@ class User {
     const usersRef = db.collection(Collections.USERS);
 
     while (!isUnique && attempts < maxAttempts) {
-      // Generate a random code between 3-8 characters
-      const length = Math.floor(Math.random() * 6) + 3; // 3-8 characters
+      const length = Math.floor(Math.random() * 6) + 3;
       code = '';
       for (let i = 0; i < length; i++) {
         code += characters.charAt(Math.floor(Math.random() * characters.length));
       }
 
-      // Check if code is unique
-      const snapshot = await usersRef
-        .where('userCode', '==', code)
-        .limit(1)
-        .get();
-
-      if (snapshot.empty) {
+      const taken = await User.isSessionCodeTaken(code);
+      if (!taken) {
         isUnique = true;
       }
       attempts++;
     }
 
     if (!isUnique) {
-      throw new Error('Unable to generate unique user code after maximum attempts');
+      throw new Error('Unable to generate unique session code after maximum attempts');
     }
 
     return code;
   }
 
-  static async findUserByCode(userCode) {
+  static async findUserBySessionCode(sessionCode) {
     try {
+      const normalized = String(sessionCode).trim().toUpperCase();
       const db = getDb();
       const usersRef = db.collection(Collections.USERS);
-      
-      const snapshot = await usersRef
-        .where('userCode', '==', userCode)
-        .where('isActive', '==', true)
-        .limit(1)
-        .get();
+
+      const runQuery = async (field) => {
+        const snapshot = await usersRef
+          .where(field, '==', normalized)
+          .where('isActive', '==', true)
+          .limit(1)
+          .get();
+        return snapshot;
+      };
+
+      let snapshot = await runQuery(User.SESSION_CODE_FIELD);
+      if (snapshot.empty) {
+        snapshot = await runQuery(User.LEGACY_USER_CODE_FIELD);
+      }
 
       if (snapshot.empty) {
         return null;
       }
 
-      const doc = snapshot.docs[0];
-      return new User({
-        id: doc.id,
-        ...doc.data(),
-      });
+      return User.hydrateUserDoc(snapshot.docs[0]);
     } catch (error) {
-      console.error('Error finding user by code:', error);
+      console.error('Error finding user by session code:', error);
       throw error;
     }
   }
 
-  static async setUserCode(userId, userCode) {
+  static async setSessionCode(userId, sessionCode) {
     try {
-      // Validate user code format
-      if (!userCode || userCode.length < 3 || userCode.length > 8) {
-        throw new Error('User code must be between 3 and 8 characters');
+      const normalized = User.normalizeSessionCode(sessionCode);
+      if (!normalized || normalized.length < 3 || normalized.length > 8) {
+        throw new Error('Session code must be between 3 and 8 characters');
+      }
+
+      if (await User.isSessionCodeTaken(normalized, userId)) {
+        throw new Error('Session code is already taken');
       }
 
       const db = getDb();
-      const usersRef = db.collection(Collections.USERS);
-
-      // Check if code is already taken by another user
-      const snapshot = await usersRef
-        .where('userCode', '==', userCode)
-        .limit(1)
-        .get();
-
-      if (!snapshot.empty) {
-        const existingDoc = snapshot.docs[0];
-        if (existingDoc.id !== userId) {
-          throw new Error('User code is already taken');
-        }
-      }
-
-      const docRef = usersRef.doc(userId);
+      const docRef = db.collection(Collections.USERS).doc(userId);
       await docRef.update({
-        userCode,
+        sessionCode: normalized,
+        ...User.legacySessionCodeFieldDeletes(),
         updatedAt: dateToTimestamp(new Date()),
       });
 
       return true;
     } catch (error) {
-      console.error('Error setting user code:', error);
+      console.error('Error setting session code:', error);
       throw error;
     }
   }
 
-  static async clearUserCode(userId) {
+  static async clearSessionCode(userId) {
     try {
       const db = getDb();
       const docRef = db.collection(Collections.USERS).doc(userId);
       
       await docRef.update({
-        userCode: null,
+        sessionCode: null,
+        ...User.legacySessionCodeFieldDeletes(),
         updatedAt: dateToTimestamp(new Date()),
       });
 
       return true;
     } catch (error) {
-      console.error('Error clearing user code:', error);
+      console.error('Error clearing session code:', error);
       throw error;
     }
   }
@@ -475,7 +539,8 @@ class User {
       name: this.name,
       email: this.email,
       isActive: this.isActive,
-      userCode: this.userCode,
+      sessionCode: this.sessionCode,
+      userCode: this.sessionCode, // backward compat for old frontend
       totpEnabled: this.totpEnabled,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
