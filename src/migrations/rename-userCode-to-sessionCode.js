@@ -80,6 +80,25 @@ async function migrate({ dryRun = false, rollback = false, onlyEmail = null } = 
       continue;
     }
 
+    if (hasFrom && hasTo && !rollback) {
+      const value = data.sessionCode ?? data[toField];
+      if (dryRun) {
+        console.log(
+          `  🔍 ${doc.id} (${data.email}) — has both fields; would keep ${toField}="${value}" and delete ${fromField}`
+        );
+      } else {
+        await doc.ref.update({
+          [toField]: String(value).trim().toUpperCase(),
+          [fromField]: FieldValue.delete(),
+        });
+        console.log(
+          `  ✅ ${doc.id} (${data.email}) — kept ${toField}="${value}", removed legacy ${fromField}`
+        );
+      }
+      changed++;
+      continue;
+    }
+
     if (!hasFrom && !hasTo) {
       console.log(`  ⏭  ${doc.id} (${data.email}) — no ${fromField} field present, skipping`);
       skipped++;

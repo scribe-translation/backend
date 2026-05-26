@@ -36,6 +36,159 @@ const validateLogin = [
     .withMessage('Password is required')
 ];
 
+const handleGetSessionCode = async (req, res) => {
+  try {
+    const user = await User.findUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+
+    res.json({
+      sessionCode: user.sessionCode,
+      userCode: user.sessionCode, // backward compat
+      hasCode: !!user.sessionCode
+    });
+
+  } catch (error) {
+    console.error('Get session code error:', error.message);
+    res.status(500).json({
+      error: 'Failed to get session code',
+      message: error.message
+    });
+  }
+};
+
+const handleGenerateSessionCode = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const sessionCode = await User.generateSessionCode();
+    await User.setSessionCode(userId, sessionCode);
+
+    res.json({
+      message: 'Session code generated successfully',
+      sessionCode,
+      userCode: sessionCode, // backward compat
+    });
+
+  } catch (error) {
+    console.error('Generate session code error:', error.message);
+    res.status(500).json({
+      error: 'Failed to generate session code',
+      message: error.message
+    });
+  }
+};
+
+const setSessionCodeValidation = [
+  body('sessionCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
+  body('userCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
+];
+
+const handleSetSessionCode = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
+    const sessionCode = req.body.sessionCode || req.body.userCode;
+    if (!sessionCode) {
+      return res.status(400).json({
+        error: 'Session code is required',
+        code: 'MISSING_SESSION_CODE'
+      });
+    }
+
+    const userId = req.user.id;
+    await User.setSessionCode(userId, sessionCode);
+
+    res.json({
+      message: 'Session code set successfully',
+      sessionCode,
+      userCode: sessionCode, // backward compat
+    });
+
+  } catch (error) {
+    console.error('Set session code error:', error.message);
+
+    if (error.message === 'Session code is already taken') {
+      return res.status(409).json({
+        error: 'Session code is already taken',
+        code: 'CODE_TAKEN'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Failed to set session code',
+      message: error.message
+    });
+  }
+};
+
+const handleClearSessionCode = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await User.clearSessionCode(userId);
+
+    res.json({
+      message: 'Session code cleared successfully'
+    });
+
+  } catch (error) {
+    console.error('Clear session code error:', error.message);
+    res.status(500).json({
+      error: 'Failed to clear session code',
+      message: error.message
+    });
+  }
+};
+
+const handleGetUserBySessionCode = async (req, res) => {
+  try {
+    const { code } = req.query;
+
+    if (!code) {
+      return res.status(400).json({
+        error: 'Session code is required',
+        code: 'MISSING_SESSION_CODE'
+      });
+    }
+
+    const user = await User.findUserBySessionCode(code);
+    if (!user) {
+      return res.status(404).json({
+        error:
+          'No active session found for this code. Ask your speaker for the current code and try again.',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        sessionCode: user.sessionCode,
+        userCode: user.sessionCode, // backward compat
+      }
+    });
+
+  } catch (error) {
+    console.error('Get user by session code error:', error.message);
+    res.status(500).json({
+      error: 'Failed to get user by session code',
+      message: error.message
+    });
+  }
+};
+
 router.get('/session-code', authenticateToken, handleGetSessionCode);
 router.get('/user-code', authenticateToken, handleGetSessionCode);
 router.get('/user-by-session-code', handleGetUserBySessionCode);
@@ -797,188 +950,6 @@ router.get('/verify-reset-token', async (req, res) => {
     });
   }
 });
-
-/**
- * @route   GET /api/auth/session-code
- * @route   GET /api/auth/user-code (backward compat)
- * @desc    Get current user's session code
- * @access  Private
- */
-const handleGetSessionCode = async (req, res) => {
-  try {
-    const user = await User.findUserById(req.user.id);
-    if (!user) {
-      return res.status(404).json({
-        error: 'User not found',
-        code: 'USER_NOT_FOUND'
-      });
-    }
-
-    res.json({
-      sessionCode: user.sessionCode,
-      userCode: user.sessionCode, // backward compat
-      hasCode: !!user.sessionCode
-    });
-
-  } catch (error) {
-    console.error('Get session code error:', error.message);
-    res.status(500).json({
-      error: 'Failed to get session code',
-      message: error.message
-    });
-  }
-};
-
-/**
- * @route   POST /api/auth/generate-session-code
- * @route   POST /api/auth/generate-user-code (backward compat)
- * @desc    Generate a new session code for the current user
- * @access  Private
- */
-const handleGenerateSessionCode = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    
-    const sessionCode = await User.generateSessionCode();
-    await User.setSessionCode(userId, sessionCode);
-
-    res.json({
-      message: 'Session code generated successfully',
-      sessionCode,
-      userCode: sessionCode, // backward compat
-    });
-
-  } catch (error) {
-    console.error('Generate session code error:', error.message);
-    res.status(500).json({
-      error: 'Failed to generate session code',
-      message: error.message
-    });
-  }
-};
-
-/**
- * @route   POST /api/auth/set-session-code
- * @route   POST /api/auth/set-user-code (backward compat)
- * @desc    Set a custom session code for the current user
- * @access  Private
- */
-const setSessionCodeValidation = [
-  body('sessionCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
-  body('userCode').optional().isLength({ min: 3, max: 8 }).matches(/^[A-Z0-9]+$/),
-];
-
-const handleSetSessionCode = async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: errors.array()
-      });
-    }
-
-    const sessionCode = req.body.sessionCode || req.body.userCode;
-    if (!sessionCode) {
-      return res.status(400).json({
-        error: 'Session code is required',
-        code: 'MISSING_SESSION_CODE'
-      });
-    }
-
-    const userId = req.user.id;
-    await User.setSessionCode(userId, sessionCode);
-
-    res.json({
-      message: 'Session code set successfully',
-      sessionCode,
-      userCode: sessionCode, // backward compat
-    });
-
-  } catch (error) {
-    console.error('Set session code error:', error.message);
-    
-    if (error.message === 'Session code is already taken') {
-      return res.status(409).json({
-        error: 'Session code is already taken',
-        code: 'CODE_TAKEN'
-      });
-    }
-    
-    res.status(500).json({
-      error: 'Failed to set session code',
-      message: error.message
-    });
-  }
-};
-
-/**
- * @route   DELETE /api/auth/session-code
- * @route   DELETE /api/auth/user-code (backward compat)
- * @desc    Clear the current user's session code
- * @access  Private
- */
-const handleClearSessionCode = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    await User.clearSessionCode(userId);
-
-    res.json({
-      message: 'Session code cleared successfully'
-    });
-
-  } catch (error) {
-    console.error('Clear session code error:', error.message);
-    res.status(500).json({
-      error: 'Failed to clear session code',
-      message: error.message
-    });
-  }
-};
-
-/**
- * @route   GET /api/auth/user-by-session-code
- * @route   GET /api/auth/user-by-code (backward compat)
- * @desc    Get user information by session code
- * @access  Public
- */
-const handleGetUserBySessionCode = async (req, res) => {
-  try {
-    const { code } = req.query;
-
-    if (!code) {
-      return res.status(400).json({
-        error: 'Session code is required',
-        code: 'MISSING_SESSION_CODE'
-      });
-    }
-
-    const user = await User.findUserBySessionCode(code);
-    if (!user) {
-      return res.status(404).json({
-        error: 'User not found for this code',
-        code: 'USER_NOT_FOUND'
-      });
-    }
-
-    res.json({
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        sessionCode: user.sessionCode,
-        userCode: user.sessionCode, // backward compat
-      }
-    });
-
-  } catch (error) {
-    console.error('Get user by session code error:', error.message);
-    res.status(500).json({
-      error: 'Failed to get user by session code',
-      message: error.message
-    });
-  }
-};
 
 /**
  * @route   GET /api/auth/connection-info

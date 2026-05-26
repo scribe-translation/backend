@@ -5,8 +5,10 @@ const cors = require('cors')
 const path = require('path')
 require('dotenv').config()
 const config = require('./src/config')
-const { authenticateSocket } = require('./src/middleware/auth')
+const { authenticateSocket, authenticateToken } = require('./src/middleware/auth')
 const authRoutes = require('./src/routes/auth')
+const User = require('./src/models/User')
+const Session = require('./src/models/Session')
 const { initFirestore } = require('./src/database/firestore')
 const speechToTextService = require('./src/services/speechToTextService')
 const googleTranslationService = require('./src/services/googleTranslationService')
@@ -1737,6 +1739,8 @@ const startServer = async () => {
                     processedTranscripts.delete(key)
                 }
             }
+
+            // Log connection statistics
             console.log(`📊 Active connections: ${activeConnections.size}, Processed transcripts: ${processedTranscripts.size}`)
         }, 5 * 60 * 1000)
 

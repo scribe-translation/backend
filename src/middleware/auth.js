@@ -49,48 +49,67 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-/**
- * Middleware to authenticate WebSocket connections
- * Supports both JWT authentication and session code-based connections
- * Accepts both auth.sessionCode and auth.userCode for backward compat
- */
-const authenticateSocket = async (socket, next) => {
-  const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
-  const sessionCode = socket.handshake.auth.sessionCode || socket.handshake.auth.userCode;
-
-  if (sessionCode) {
-    if (!/^[A-Z0-9]{3,8}$/.test(sessionCode)) {
-      console.log(`❌ Invalid session code format: ${sessionCode}`);
-      return next(new Error('Invalid session code format'));
-    }
-    
-    try {
-      const user = await User.findUserBySessionCode(sessionCode);
-      if (!user) {
-        console.log(`❌ User not found for session code: ${sessionCode}`);
-        return next(new Error('User not found for this session code'));
-      }
-      
-      socket.sessionCode = sessionCode;
-      socket.userCode = sessionCode; // backward compat for server.js
-      socket.user = user;
-      socket.needsTokenRefresh = false;
-    } catch (error) {
-      console.error('Error validating session code:', error);
-      return next(new Error('Session code validation failed'));
-    }
+const attachSocketSessionCode = (socket, user, clientSessionCode) => {
+  const code = user.sessionCode || clientSessionCode;
+  if (code) {
+    socket.sessionCode = code;
   }
+};
+
+const authenticateBySessionCodeOnly = async (socket, sessionCode, next) => {
+  if (!/^[A-Z0-9]{3,8}$/.test(sessionCode)) {
+    console.log(`❌ Invalid session code format: ${sessionCode}`);
+    return next(new Error('Invalid session code format'));
+  }
+
+  try {
+    const user = await User.findUserBySessionCode(sessionCode);
+    if (!user) {
+      console.log(`❌ User not found for session code: ${sessionCode}`);
+      return next(
+        new Error(
+          'No active session found for this code. Double-check with your speaker and try again.'
+        )
+      );
+    }
+
+    socket.sessionCode = sessionCode;
+    socket.userCode = sessionCode;
+    socket.user = user;
+    socket.needsTokenRefresh = false;
+    return next();
+  } catch (error) {
+    console.error('Error validating session code:', error);
+    return next(new Error('Session code validation failed'));
+  }
+};
+
+const authenticateSocket = async (socket, next) => {
+  const token =
+    socket.handshake.auth.token ||
+    socket.handshake.headers.authorization?.split(' ')[1];
+  const sessionCodeRaw =
+    socket.handshake.auth.sessionCode || socket.handshake.auth.userCode;
+  const sessionCode = sessionCodeRaw
+    ? String(sessionCodeRaw).trim().toUpperCase()
+    : null;
 
   if (token) {
     jwt.verify(token, JWT_SECRET, async (err, decoded) => {
       if (err) {
         if (err.name === 'TokenExpiredError') {
-          console.log('🔄 Token expired, allowing connection with session code-only mode');
+          if (sessionCode) {
+            console.log(
+              '🔄 Token expired, falling back to session-code authentication'
+            );
+            return authenticateBySessionCodeOnly(socket, sessionCode, next);
+          }
+          console.log('🔄 Token expired, allowing connection without user');
           socket.user = null;
           socket.needsTokenRefresh = true;
           return next();
         }
-        
+
         console.error('❌ JWT verification error:', err.message);
         return next(new Error('Invalid token'));
       }
@@ -103,17 +122,21 @@ const authenticateSocket = async (socket, next) => {
 
         socket.user = user;
         socket.needsTokenRefresh = false;
-        next();
+        attachSocketSessionCode(socket, user, sessionCode);
+        return next();
       } catch (error) {
         console.error('Database error during socket authentication:', error);
         return next(new Error('Authentication failed'));
       }
     });
-  } else if (sessionCode) {
-    next();
-  } else {
-    return next(new Error('Authentication token or session code required'));
+    return;
   }
+
+  if (sessionCode) {
+    return authenticateBySessionCodeOnly(socket, sessionCode, next);
+  }
+
+  return next(new Error('Authentication token or session code required'));
 };
 
 /**

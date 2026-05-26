@@ -9,6 +9,8 @@
     "dev:script": "bash dev.sh",
     "dev:server": "FIRESTORE_EMULATOR_HOST=localhost:8181 NODE_ENV=dev nodemon server.js",
     "emulator": "firebase emulators:start --only firestore --project demo-scribe --import=./emulator-data --export-on-exit=./emulator-data",
+    "migrate:session-code": "node src/migrations/rename-userCode-to-sessionCode.js",
+    "migrate:session-code:dry-run": "node src/migrations/rename-userCode-to-sessionCode.js --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1",
     "kill": "bash shutdown.sh",
     "cleanup": "pkill -f 'firebase.*emulators' || true"
