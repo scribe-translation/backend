@@ -55,7 +55,9 @@ const audioBufferDuringRestart = new Map() // Buffer audio during stream restart
 const currentBubbleIds = new Map() // Track current bubbleId per socket (updated by incoming audio)
 const contentHashes = new Map() // Track content hashes for deduplication
 const typingIndicatorTimeouts = new Map() // Track typing indicator timeouts per socket
-const streamRotationBubbleId = new Map() // Lock bubbleId for STT results during lazy rotation window
+const lastInterimBySocket = new Map() // Last interim transcript per socket (force-finalize fallback)
+const forceFinalizeSafetyTimers = new Map() // Safety timers for force-finalize ack
+const rotatingStreams = new Map() // Prevent concurrent stream rotations per socket
 
 const interimTranslationThrottle = new Map()
 const INTERIM_THROTTLE_MS = 1000
@@ -383,20 +385,105 @@ async function processTranslations(translationConnections, transcript, sourceLan
 // Initialize the message queue
 messageQueue = new MessageQueue(io)
 
-function resolveSttBubbleId(socket) {
-    if (streamRotationBubbleId.has(socket.id)) {
-        const locked = streamRotationBubbleId.get(socket.id)
-        if (locked != null && locked !== '') return locked
+function clearForceFinalizeSafetyTimer(socketId) {
+    if (forceFinalizeSafetyTimers.has(socketId)) {
+        clearTimeout(forceFinalizeSafetyTimers.get(socketId))
+        forceFinalizeSafetyTimers.delete(socketId)
     }
-    return currentBubbleIds.get(socket.id)
+}
+
+function cleanupSocketStreamState(socketId) {
+    speechToTextService.cleanupRotation(socketId)
+    clearForceFinalizeSafetyTimer(socketId)
+    rotatingStreams.delete(socketId)
+    restartingStreams.delete(socketId)
+    audioBufferDuringRestart.delete(socketId)
+    lastInterimBySocket.delete(socketId)
+    currentBubbleIds.delete(socketId)
+}
+
+async function rotateStream(socket, options = {}) {
+    const { emergency = false } = options
+    const socketId = socket.id
+
+    if (!emergency && !speechToTextService.isRotationArmed(socketId)) {
+        return
+    }
+
+    if (rotatingStreams.get(socketId)) {
+        return
+    }
+    rotatingStreams.set(socketId, true)
+
+    const conn = activeConnections.get(socketId)
+    const sourceLanguage = conn?.sourceLanguage || 'en-CA'
+    const speechEndTimeout = conn?.speechEndTimeout ?? 1.0
+    const oldStream = streamingSessions.get(socketId)
+
+    restartingStreams.set(socketId, true)
+    if (!audioBufferDuringRestart.has(socketId)) {
+        audioBufferDuringRestart.set(socketId, [])
+    }
+
+    try {
+        let newStream = null
+        let retries = 0
+        const maxRetries = 3
+
+        while (!newStream && retries < maxRetries) {
+            try {
+                newStream = await speechToTextService.startStreamingRecognition(
+                    sourceLanguage,
+                    speechEndTimeout,
+                    createStreamCallbacks(socket)
+                )
+            } catch (err) {
+                retries++
+                console.error(`❌ rotateStream: failed to create new stream (attempt ${retries}):`, err)
+                if (retries < maxRetries) {
+                    await new Promise((resolve) => setTimeout(resolve, 500))
+                }
+            }
+        }
+
+        if (!newStream) {
+            console.error(`❌ rotateStream: all retries failed for ${socketId}, keeping old stream`)
+            return
+        }
+
+        if (oldStream) {
+            speechToTextService.endStreamingRecognition(oldStream)
+        }
+
+        streamingSessions.set(socketId, newStream)
+        speechToTextService.clearRotation(socketId)
+        clearForceFinalizeSafetyTimer(socketId)
+
+        const bufferedAudio = audioBufferDuringRestart.get(socketId) || []
+        for (const audioBuffer of bufferedAudio) {
+            speechToTextService.sendAudioToStream(newStream, audioBuffer)
+        }
+
+        console.log(`✅ [ROTATE] Stream rotated for ${socketId}, flushed ${bufferedAudio.length} buffered chunks`)
+    } catch (err) {
+        console.error(`❌ rotateStream failed for ${socketId}:`, err)
+    } finally {
+        restartingStreams.delete(socketId)
+        audioBufferDuringRestart.delete(socketId)
+        rotatingStreams.delete(socketId)
+    }
 }
 
 function createStreamCallbacks(socket) {
     return {
         onResult: async (result) => {
-            const activeBubbleId = resolveSttBubbleId(socket) || ''
+            const activeBubbleId = currentBubbleIds.get(socket.id) || ''
             const sourceLanguage =
                 activeConnections.get(socket.id)?.sourceLanguage || 'en-CA'
+
+            if (!result.isFinal && result.transcript && result.transcript.trim()) {
+                lastInterimBySocket.set(socket.id, result.transcript.trim())
+            }
 
             socket.emit('transcriptionUpdate', {
                 transcript: result.transcript,
@@ -433,6 +520,7 @@ function createStreamCallbacks(socket) {
                         typingIndicatorTimeouts.delete(socket.id)
                     }
                 }
+                lastInterimBySocket.delete(socket.id)
                 socket.emit('finalResultReceived', { bubbleId: activeBubbleId })
                 await handleFinalTranscription(
                     socket,
@@ -440,17 +528,23 @@ function createStreamCallbacks(socket) {
                     sourceLanguage,
                     activeBubbleId
                 )
+
+                if (speechToTextService.isRotationArmed(socket.id)) {
+                    console.log(`🔄 [ROTATE] Final received, rotating stream for ${socket.id}`)
+                    await rotateStream(socket)
+                }
             }
         },
         onError: (error) => {
             console.error('❌ Google Cloud streaming error:', error)
             if (error.code === 14 || (error.message && error.message.includes('UNAVAILABLE'))) {
-                setTimeout(() => {
+                setTimeout(async () => {
                     if (socket.connected) {
                         socket.emit('streamRestart', {
                             reason: 'recovery',
                             error: error.message
                         })
+                        await rotateStream(socket, { emergency: true })
                     }
                 }, 1000)
             }
@@ -458,119 +552,48 @@ function createStreamCallbacks(socket) {
         onEnd: () => {
             streamingSessions.delete(socket.id)
         },
-        onPreRestart: () => {
-            const currentStream = streamingSessions.get(socket.id)
-            if (!currentStream) return
-            if (speechToTextService.isStandbyNeeded(socket.id)) return
+        onRotationArm: () => {
+            if (speechToTextService.isRotationArmed(socket.id)) return
+            speechToTextService.armRotation(socket.id)
+            console.log(`⏰ [ROTATE] Rotation armed for ${socket.id} at 3:00`)
+        },
+        onForceFinalize: () => {
+            if (!socket.connected) return
 
-            speechToTextService.markStandbyNeeded(socket.id)
-            const b = currentBubbleIds.get(socket.id)
-            if (b) streamRotationBubbleId.set(socket.id, b)
+            clearForceFinalizeSafetyTimer(socket.id)
+            socket.emit('forceFinalize', { timestamp: Date.now() })
 
+            const safetyTimer = setTimeout(async () => {
+                forceFinalizeSafetyTimers.delete(socket.id)
+                const lastInterim = lastInterimBySocket.get(socket.id)
+                if (lastInterim && lastInterim.trim()) {
+                    const activeBubbleId = currentBubbleIds.get(socket.id) || ''
+                    const sourceLanguage =
+                        activeConnections.get(socket.id)?.sourceLanguage || 'en-CA'
+                    await handleFinalTranscription(
+                        socket,
+                        lastInterim,
+                        sourceLanguage,
+                        activeBubbleId
+                    )
+                    lastInterimBySocket.delete(socket.id)
+                }
+                if (speechToTextService.isRotationArmed(socket.id)) {
+                    await rotateStream(socket)
+                }
+            }, 1500)
+
+            forceFinalizeSafetyTimers.set(socket.id, safetyTimer)
+        },
+        onRestart: async () => {
             if (socket.connected) {
-                socket.emit('streamRestartPending', {
-                    reason: 'stream_window',
+                socket.emit('streamRestart', {
+                    reason: 'stream_health',
                     timestamp: Date.now()
                 })
             }
-        },
-        onRestart: async () => {
-            await performHardStreamRestart(socket)
+            await rotateStream(socket, { emergency: true })
         }
-    }
-}
-
-async function performHardStreamRestart(socket) {
-    speechToTextService.clearStandbyNeeded(socket.id)
-    streamRotationBubbleId.delete(socket.id)
-
-    restartingStreams.set(socket.id, true)
-    audioBufferDuringRestart.set(socket.id, [])
-
-    if (socket.connected) {
-        socket.emit('streamRestart', {
-            reason: '5-minute-limit-or-recovery',
-            timestamp: Date.now()
-        })
-    }
-
-    const oldStream = streamingSessions.get(socket.id)
-    if (oldStream) {
-        speechToTextService.endStreamingRecognition(oldStream)
-    }
-    streamingSessions.delete(socket.id)
-
-    const socketPrefix = `${socket.id}-`
-    for (const [key, _] of processedTranscripts.entries()) {
-        if (key.startsWith(socketPrefix)) {
-            processedTranscripts.delete(key)
-        }
-    }
-
-    const conn = activeConnections.get(socket.id)
-    const sourceLanguage = conn?.sourceLanguage || 'en-CA'
-    const speechEndTimeout = conn?.speechEndTimeout ?? 1.0
-
-    try {
-        const newStream = await speechToTextService.startStreamingRecognition(
-            sourceLanguage,
-            speechEndTimeout,
-            createStreamCallbacks(socket)
-        )
-        if (newStream) {
-            streamingSessions.set(socket.id, newStream)
-            const bufferedAudio = audioBufferDuringRestart.get(socket.id) || []
-            for (const audioBuffer of bufferedAudio) {
-                speechToTextService.sendAudioToStream(newStream, audioBuffer)
-            }
-        }
-    } catch (err) {
-        console.error('❌ performHardStreamRestart failed:', err)
-    }
-
-    restartingStreams.delete(socket.id)
-    audioBufferDuringRestart.delete(socket.id)
-
-    if (socket.connected) {
-        socket.emit('streamRestarted', {
-            newBubbleId: currentBubbleIds.get(socket.id) || null
-        })
-    }
-}
-
-async function performLazyStreamRotation(socket) {
-    if (!speechToTextService.isStandbyNeeded(socket.id)) return
-
-    speechToTextService.clearStandbyNeeded(socket.id)
-    streamRotationBubbleId.delete(socket.id)
-
-    const oldStream = streamingSessions.get(socket.id)
-    if (oldStream) {
-        speechToTextService.endStreamingRecognition(oldStream)
-    }
-    streamingSessions.delete(socket.id)
-
-    const conn = activeConnections.get(socket.id)
-    const sourceLanguage = conn?.sourceLanguage || 'en-CA'
-    const speechEndTimeout = conn?.speechEndTimeout ?? 1.0
-
-    try {
-        const newStream = await speechToTextService.startStreamingRecognition(
-            sourceLanguage,
-            speechEndTimeout,
-            createStreamCallbacks(socket)
-        )
-        if (newStream) {
-            streamingSessions.set(socket.id, newStream)
-        }
-    } catch (err) {
-        console.error('❌ performLazyStreamRotation failed:', err)
-    }
-
-    if (socket.connected) {
-        socket.emit('streamRestarted', {
-            newBubbleId: currentBubbleIds.get(socket.id) || null
-        })
     }
 }
 
@@ -616,11 +639,13 @@ io.on('connection', async (socket) => {
                 speechToTextService.endStreamingRecognition(recognizeStream);
                 streamingSessions.delete(socketId);
             }
-            speechToTextService.cleanupStandbyStream(socketId);
-            streamRotationBubbleId.delete(socketId);
+            speechToTextService.cleanupRotation(socketId);
+            clearForceFinalizeSafetyTimer(socketId);
+            rotatingStreams.delete(socketId);
             activeConnections.delete(socketId);
             restartingStreams.delete(socketId);
             audioBufferDuringRestart.delete(socketId);
+            lastInterimBySocket.delete(socketId);
             currentBubbleIds.delete(socketId);
             cleanupContentHashes(socketId);
             if (messageQueue) {
@@ -940,9 +965,8 @@ io.on('connection', async (socket) => {
                 if (existingStream) {
                     speechToTextService.endStreamingRecognition(existingStream);
                     streamingSessions.delete(socket.id);
-                    // Clear any standby streams for this socket
-                    speechToTextService.cleanupStandbyStream(socket.id);
-                    streamRotationBubbleId.delete(socket.id);
+                    speechToTextService.cleanupRotation(socket.id);
+                    clearForceFinalizeSafetyTimer(socket.id);
                     // Notify frontend that stream is restarting due to language change
                     socket.emit('streamRestart', {
                         reason: 'language_changed',
@@ -1133,6 +1157,11 @@ io.on('connection', async (socket) => {
                         userEmail: currentConnection?.userEmail
                     })
                 }
+
+                lastInterimBySocket.delete(socket.id)
+                if (speechToTextService.isRotationArmed(socket.id)) {
+                    await rotateStream(socket)
+                }
             }
 
         } catch (error) {
@@ -1166,10 +1195,21 @@ io.on('connection', async (socket) => {
             speechToTextService.endStreamingRecognition(recognizeStream)
             streamingSessions.delete(socket.id)
         }
+
+        cleanupSocketStreamState(socket.id)
+    })
+
+    socket.on('forceFinalizeAck', async () => {
+        clearForceFinalizeSafetyTimer(socket.id)
+        lastInterimBySocket.delete(socket.id)
+
+        if (speechToTextService.isRotationArmed(socket.id)) {
+            await rotateStream(socket)
+        }
     })
 
     // Handle client request for stream restart (e.g., when client detects hung stream)
-    socket.on('requestStreamRestart', (data) => {
+    socket.on('requestStreamRestart', async (data) => {
         console.log(`🔄 Client ${socket.id} requested stream restart: ${data?.reason || 'unknown'}`);
 
         // End existing stream
@@ -1179,11 +1219,9 @@ io.on('connection', async (socket) => {
             streamingSessions.delete(socket.id);
         }
 
-        // Clean up any standby streams
-        speechToTextService.cleanupStandbyStream(socket.id);
-        streamRotationBubbleId.delete(socket.id);
-
-        // Clear restart state
+        speechToTextService.cleanupRotation(socket.id);
+        clearForceFinalizeSafetyTimer(socket.id);
+        rotatingStreams.delete(socket.id);
         restartingStreams.delete(socket.id);
         audioBufferDuringRestart.delete(socket.id);
 
@@ -1192,6 +1230,8 @@ io.on('connection', async (socket) => {
             reason: data?.reason || 'client_request',
             timestamp: Date.now()
         });
+
+        await rotateStream(socket, { emergency: true });
     })
 
     socket.on('setTargetLanguage', (data) => {
@@ -1293,9 +1333,7 @@ io.on('connection', async (socket) => {
         }
 
         // Clean up restart state
-        restartingStreams.delete(socket.id)
-        audioBufferDuringRestart.delete(socket.id)
-        currentBubbleIds.delete(socket.id)
+        cleanupSocketStreamState(socket.id)
 
         // Clean up typing indicator timeout
         if (typingIndicatorTimeouts.has(socket.id)) {
@@ -1304,10 +1342,6 @@ io.on('connection', async (socket) => {
         }
 
         interimTranslationThrottle.delete(socket.id)
-
-        // Clean up any standby streams
-        speechToTextService.cleanupStandbyStream(socket.id)
-        streamRotationBubbleId.delete(socket.id)
 
         // Clean up content hashes
         cleanupContentHashes(socket.id)
@@ -1369,10 +1403,12 @@ setInterval(() => {
                 speechToTextService.endStreamingRecognition(recognizeStream);
                 streamingSessions.delete(socketId);
             }
-            speechToTextService.cleanupStandbyStream(socketId);
-            streamRotationBubbleId.delete(socketId);
+            speechToTextService.cleanupRotation(socketId);
+            clearForceFinalizeSafetyTimer(socketId);
+            rotatingStreams.delete(socketId);
             restartingStreams.delete(socketId);
             audioBufferDuringRestart.delete(socketId);
+            lastInterimBySocket.delete(socketId);
             currentBubbleIds.delete(socketId);
             interimTranslationThrottle.delete(socketId);
             if (typingIndicatorTimeouts.has(socketId)) {
@@ -1489,12 +1525,6 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
 
 // Helper function to handle final transcription processing (translation and delivery)
 async function handleFinalTranscription(socket, transcript, sourceLanguage, activeBubbleId) {
-    // Lazy rotation first so the new Google stream is ready before more audio arrives
-    if (speechToTextService.isStandbyNeeded(socket.id)) {
-        console.log(`🔄 [HANDOFF] Final transcription received, lazy-rotating stream for ${socket.id}`);
-        await performLazyStreamRotation(socket);
-    }
-
     // Accumulate the transcript
     const currentText = sessionTranscripts.get(socket.id) || '';
     sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + transcript);

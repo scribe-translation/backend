@@ -11,20 +11,20 @@ class SpeechToTextService {
     this.credentials = null;
     // Note: Client initialization is deferred to getSpeechClient() for faster startup
     
-    // Lazy rotation: flag set at ~3.5m; new Google stream opens on next final or forced at ~4.5m
-    this.standbyNeededBySocket = new Map(); // socketId -> true
+    // Rotation armed at 3:00; new Google stream opens on next final or forced at 4:40
+    this.rotationArmedBySocket = new Map(); // socketId -> true
   }
 
-  markStandbyNeeded(socketId) {
-    this.standbyNeededBySocket.set(socketId, true);
+  armRotation(socketId) {
+    this.rotationArmedBySocket.set(socketId, true);
   }
 
-  isStandbyNeeded(socketId) {
-    return this.standbyNeededBySocket.get(socketId) === true;
+  isRotationArmed(socketId) {
+    return this.rotationArmedBySocket.get(socketId) === true;
   }
 
-  clearStandbyNeeded(socketId) {
-    this.standbyNeededBySocket.delete(socketId);
+  clearRotation(socketId) {
+    this.rotationArmedBySocket.delete(socketId);
   }
 
   async initializeCredentials() {
@@ -288,29 +288,24 @@ class SpeechToTextService {
     recognizeStream._health = streamHealth;
 
     // Google Cloud streaming limit is ~5 minutes (305 seconds)
-    // Pre-restart: Create standby at 3.5 minutes
-    const STANDBY_CREATION_TIME = (3.5 * 60 * 1000); // 3.5 minutes
-    // Hard restart: Force restart at 4.5 minutes to ensure we don't hit the limit
-    const HARD_RESTART_TIME = (4.5 * 60 * 1000); // 4.5 minutes
-    // Health check: If no data received for 30 seconds while audio is being sent, restart
+    const ROTATION_ARM_TIME = 180000; // 3:00 — arm rotation, wait for finalization boundary
+    const FORCE_FINALIZE_TIME = 280000; // 4:40 — force-finalize if speaker never pauses
     const HEALTH_CHECK_INTERVAL = 10000; // Check every 10 seconds
     const DATA_TIMEOUT = 30000; // 30 seconds without data = problem
 
-    // Set up automatic standby creation timer
-    const standbyTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Standby timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
-      if (callbacks && callbacks.onPreRestart && typeof callbacks.onPreRestart === 'function') {
-        callbacks.onPreRestart();
+    const rotationArmTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Rotation arm timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      if (callbacks && callbacks.onRotationArm && typeof callbacks.onRotationArm === 'function') {
+        callbacks.onRotationArm();
       }
-    }, STANDBY_CREATION_TIME);
+    }, ROTATION_ARM_TIME);
 
-    // Set up HARD restart timer - force restart before hitting Google's limit
-    const hardRestartTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Hard restart timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s - forcing restart`);
-      if (callbacks && callbacks.onRestart && typeof callbacks.onRestart === 'function') {
-        callbacks.onRestart();
+    const forceFinalizeTimer = setTimeout(() => {
+      console.log(`⏰ [STREAM] Force-finalize timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      if (callbacks && callbacks.onForceFinalize && typeof callbacks.onForceFinalize === 'function') {
+        callbacks.onForceFinalize();
       }
-    }, HARD_RESTART_TIME);
+    }, FORCE_FINALIZE_TIME);
 
     // Health check - detect silent stream failures
     const healthCheckInterval = setInterval(() => {
@@ -334,9 +329,8 @@ class SpeechToTextService {
       }
     }, HEALTH_CHECK_INTERVAL);
     
-    // Attach timers to stream so they can be cleared
-    recognizeStream._standbyTimer = standbyTimer;
-    recognizeStream._hardRestartTimer = hardRestartTimer;
+    recognizeStream._rotationArmTimer = rotationArmTimer;
+    recognizeStream._forceFinalizeTimer = forceFinalizeTimer;
     recognizeStream._healthCheckInterval = healthCheckInterval;
 
     // Handle streaming responses - Works with both V1 and V2 models
@@ -375,9 +369,8 @@ class SpeechToTextService {
         metadata: error.metadata
       });
       
-      // Clear all timers
-      clearTimeout(standbyTimer);
-      clearTimeout(hardRestartTimer);
+      clearTimeout(rotationArmTimer);
+      clearTimeout(forceFinalizeTimer);
       clearInterval(healthCheckInterval);
       
       // Mark stream as destroyed on error
@@ -413,8 +406,8 @@ class SpeechToTextService {
 
     recognizeStream.on('end', () => {
       console.log(`📊 [STREAM] Stream ended after ${(Date.now() - streamHealth.createdAt) / 1000}s`);
-      clearTimeout(standbyTimer);
-      clearTimeout(hardRestartTimer);
+      clearTimeout(rotationArmTimer);
+      clearTimeout(forceFinalizeTimer);
       clearInterval(healthCheckInterval);
       if (callbacks && callbacks.onEnd) {
         callbacks.onEnd();
@@ -452,13 +445,13 @@ class SpeechToTextService {
         clearTimeout(recognizeStream._restartTimer);
         recognizeStream._restartTimer = null;
       }
-      if (recognizeStream._standbyTimer) {
-        clearTimeout(recognizeStream._standbyTimer);
-        recognizeStream._standbyTimer = null;
+      if (recognizeStream._rotationArmTimer) {
+        clearTimeout(recognizeStream._rotationArmTimer);
+        recognizeStream._rotationArmTimer = null;
       }
-      if (recognizeStream._hardRestartTimer) {
-        clearTimeout(recognizeStream._hardRestartTimer);
-        recognizeStream._hardRestartTimer = null;
+      if (recognizeStream._forceFinalizeTimer) {
+        clearTimeout(recognizeStream._forceFinalizeTimer);
+        recognizeStream._forceFinalizeTimer = null;
       }
       if (recognizeStream._healthCheckInterval) {
         clearInterval(recognizeStream._healthCheckInterval);
@@ -477,10 +470,10 @@ class SpeechToTextService {
   }
 
   /**
-   * Clear lazy-rotation flag (disconnect / language change / client restart)
+   * Clear rotation flag (disconnect / language change / client restart)
    */
-  cleanupStandbyStream(socketId) {
-    this.standbyNeededBySocket.delete(socketId);
+  cleanupRotation(socketId) {
+    this.rotationArmedBySocket.delete(socketId);
   }
 
 
