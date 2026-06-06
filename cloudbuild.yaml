@@ -36,7 +36,8 @@ steps:
       - '--max-instances'
       - '10'
       - '--timeout'
-      - '600'
+      - '3600'
+      - '--session-affinity'
       - '--concurrency'
       - '80'
 
