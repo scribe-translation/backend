@@ -58,6 +58,10 @@ const typingIndicatorTimeouts = new Map() // Track typing indicator timeouts per
 const lastInterimBySocket = new Map() // Last interim transcript per socket (force-finalize fallback)
 const forceFinalizeSafetyTimers = new Map() // Safety timers for force-finalize ack
 const rotatingStreams = new Map() // Prevent concurrent stream rotations per socket
+// #region agent log
+let __dbgAudioCount = 0
+const __dbg = (location, message, data) => { try { fetch('http://127.0.0.1:7809/ingest/3c5ff2ee-7cbf-4a34-a4e1-f6d7b649a94d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a86d7b'},body:JSON.stringify({sessionId:'a86d7b',location,message,data,timestamp:Date.now()})}).catch(()=>{}) } catch(e){} }
+// #endregion
 
 const interimTranslationThrottle = new Map()
 const INTERIM_THROTTLE_MS = 1000
@@ -425,6 +429,10 @@ async function rotateStream(socket, options = {}) {
         audioBufferDuringRestart.set(socketId, [])
     }
 
+    // #region agent log
+    __dbg('server.js:rotateStream', 'ROTATE entry', { socketId, emergency, armed: speechToTextService.isRotationArmed(socketId), hasOldStream: !!oldStream })
+    // #endregion
+
     try {
         let newStream = null
         let retries = 0
@@ -465,12 +473,18 @@ async function rotateStream(socket, options = {}) {
         }
 
         console.log(`✅ [ROTATE] Stream rotated for ${socketId}, flushed ${bufferedAudio.length} buffered chunks`)
+        // #region agent log
+        __dbg('server.js:rotateStream', 'ROTATE success', { socketId, flushed: bufferedAudio.length, newDestroyed: !!newStream.destroyed })
+        // #endregion
     } catch (err) {
         console.error(`❌ rotateStream failed for ${socketId}:`, err)
     } finally {
         restartingStreams.delete(socketId)
         audioBufferDuringRestart.delete(socketId)
         rotatingStreams.delete(socketId)
+        // #region agent log
+        __dbg('server.js:rotateStream', 'ROTATE finally cleanup', { socketId, restartingStillSet: restartingStreams.has(socketId), rotatingStillSet: rotatingStreams.has(socketId) })
+        // #endregion
     }
 }
 
@@ -1050,9 +1064,9 @@ io.on('connection', async (socket) => {
                             if (buffer.length > 100) {
                                 buffer.shift();
                             }
-                            // Log buffering every 50 chunks
-                            if (buffer.length % 50 === 0) {
-                            }
+                            // #region agent log
+                            if (buffer.length % 25 === 1) __dbg('server.js:audio', 'AUDIO buffering during restart', { socketId: socket.id, bufferLen: buffer.length, rotating: !!rotatingStreams.get(socket.id) })
+                            // #endregion
                             return; // Don't try to send to stream while restarting
                         }
 
@@ -1061,7 +1075,13 @@ io.on('connection', async (socket) => {
                         if (recognizeStream && !recognizeStream.destroyed) {
                             // Send audio only to active stream (standby streams don't receive audio until activated)
                             speechToTextService.sendAudioToStream(recognizeStream, audioBuffer);
+                            // #region agent log
+                            if ((++__dbgAudioCount) % 150 === 0) __dbg('server.js:audio', 'AUDIO sent to active stream', { socketId: socket.id, counter: __dbgAudioCount })
+                            // #endregion
                         } else {
+                            // #region agent log
+                            __dbg('server.js:audio', 'AUDIO no valid stream', { socketId: socket.id, hasStream: !!recognizeStream, destroyed: recognizeStream?.destroyed, restarting: !!restartingStreams.get(socket.id), sessionExists: streamingSessions.has(socket.id) })
+                            // #endregion
                             // Only log error if we're not in a transient state
                             if (!restartingStreams.get(socket.id)) {
                                 console.error('❌ No valid stream found for socket:', socket.id, {
@@ -1304,6 +1324,9 @@ io.on('connection', async (socket) => {
     socket.on('disconnect', async () => {
         const connection = activeConnections.get(socket.id)
 
+        // #region agent log
+        __dbg('server.js:disconnect', 'DISCONNECT', { socketId: socket.id, user: connection?.userEmail || 'listener', isStreaming: !!connection?.isStreaming, hasStream: streamingSessions.has(socket.id), armed: speechToTextService.isRotationArmed(socket.id), restarting: !!restartingStreams.get(socket.id) })
+        // #endregion
         console.log(`🔌 Disconnect: ${socket.id} (user: ${connection?.userEmail || 'listener'})`)
         console.log(`📊 Total connections before remove: ${activeConnections.size}`)
 
