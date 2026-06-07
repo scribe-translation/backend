@@ -679,6 +679,7 @@ io.on('connection', async (socket) => {
         targetLanguage: null,
         needsTokenRefresh: socket.needsTokenRefresh || false,
         lastPing: Date.now(),
+        connectedAt: Date.now(),
         pingTimeout: null,
         connectionQuality: 'good', // good, poor, critical
         messageCount: 0,
@@ -723,11 +724,11 @@ io.on('connection', async (socket) => {
     socket.on('ping', () => {
         const connection = activeConnections.get(socket.id)
         if (connection) {
+            const timeSinceLastPing = Date.now() - connection.lastPing
             connection.lastPing = Date.now()
             connection.lastActivity = Date.now()
 
             // Update connection quality based on ping frequency
-            const timeSinceLastPing = Date.now() - connection.lastPing
             if (timeSinceLastPing > 20000) {
                 connection.connectionQuality = 'poor'
             } else if (timeSinceLastPing > 30000) {
@@ -1327,7 +1328,10 @@ io.on('connection', async (socket) => {
         // #region agent log
         __dbg('server.js:disconnect', 'DISCONNECT', { socketId: socket.id, user: connection?.userEmail || 'listener', isStreaming: !!connection?.isStreaming, hasStream: streamingSessions.has(socket.id), armed: speechToTextService.isRotationArmed(socket.id), restarting: !!restartingStreams.get(socket.id) })
         // #endregion
-        console.log(`🔌 Disconnect: ${socket.id} (user: ${connection?.userEmail || 'listener'})`)
+        const connectionAgeSeconds = connection?.connectedAt
+            ? Math.round((Date.now() - connection.connectedAt) / 1000)
+            : null
+        console.log(`🔌 Disconnect: ${socket.id} (user: ${connection?.userEmail || 'listener'}, age: ${connectionAgeSeconds ?? 'unknown'}s)`)
         console.log(`📊 Total connections before remove: ${activeConnections.size}`)
 
         // Clean up ping timeout
