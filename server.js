@@ -123,35 +123,76 @@ function cleanupContentHashes(socketId) {
 class MessageQueue {
     constructor(io) {
         this.io = io
-        this.queues = new Map() // Per-listener message queues: socketId -> Map<messageId, message>
+        this.queues = new Map() // listenerKey -> Map<messageId, message>
         this.retryInterval = 2000 // Retry every 2 seconds
         this.maxRetries = 5
         this.messageExpiry = 30000 // Messages expire after 30 seconds
-        this.sequenceNumbers = new Map() // Per-listener sequence numbers
+        this.sequenceNumbers = new Map() // listenerKey -> sequence number
+        this.socketToListenerKey = new Map() // socketId -> listenerKey
+        this.listenerKeyToSocket = new Map() // listenerKey -> current socketId
+        this.cleanupTimers = new Map() // listenerKey -> grace timer
+        this.listenerCleanupGraceMs = 30000
 
         // Start the retry loop
         this.startRetryLoop()
+    }
+
+    static listenerKey(sessionCode, targetLanguage) {
+        return `${sessionCode}:${targetLanguage}`
+    }
+
+    bindSocket(socketId, sessionCode, targetLanguage) {
+        if (!sessionCode || !targetLanguage) return
+
+        const key = MessageQueue.listenerKey(sessionCode, targetLanguage)
+        this.cancelScheduledCleanup(key)
+
+        const previousSocket = this.listenerKeyToSocket.get(key)
+        if (previousSocket && previousSocket !== socketId) {
+            this.socketToListenerKey.delete(previousSocket)
+        }
+
+        this.socketToListenerKey.set(socketId, key)
+        this.listenerKeyToSocket.set(key, socketId)
+    }
+
+    resolveListenerKey(socketId, connection = null) {
+        const mappedKey = this.socketToListenerKey.get(socketId)
+        if (mappedKey) return mappedKey
+
+        if (connection?.sessionCode && connection?.targetLanguage) {
+            this.bindSocket(socketId, connection.sessionCode, connection.targetLanguage)
+            return this.socketToListenerKey.get(socketId)
+        }
+
+        return null
     }
 
     generateMessageId() {
         return `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     }
 
-    getNextSequence(socketId) {
-        const current = this.sequenceNumbers.get(socketId) || 0
+    getNextSequence(listenerKey) {
+        const current = this.sequenceNumbers.get(listenerKey) || 0
         const next = current + 1
-        this.sequenceNumbers.set(socketId, next)
+        this.sequenceNumbers.set(listenerKey, next)
         return next
     }
 
     // Queue a message for delivery to a specific listener
     queueMessage(socketId, message) {
-        if (!this.queues.has(socketId)) {
-            this.queues.set(socketId, new Map())
+        const listenerKey = this.socketToListenerKey.get(socketId)
+        if (!listenerKey) {
+            console.warn(`⚠️ No listener key bound for socket ${socketId}, skipping queue`)
+            return null
+        }
+
+        if (!this.queues.has(listenerKey)) {
+            this.queues.set(listenerKey, new Map())
         }
 
         const messageId = this.generateMessageId()
-        const sequence = this.getNextSequence(socketId)
+        const sequence = this.getNextSequence(listenerKey)
 
         const queuedMessage = {
             ...message,
@@ -162,17 +203,18 @@ class MessageQueue {
             acknowledged: false
         }
 
-        this.queues.get(socketId).set(messageId, queuedMessage)
+        this.queues.get(listenerKey).set(messageId, queuedMessage)
 
         // Attempt immediate delivery
-        this.deliverMessage(socketId, queuedMessage)
+        this.deliverMessage(listenerKey, queuedMessage)
 
         return messageId
     }
 
     // Attempt to deliver a message
-    deliverMessage(socketId, message) {
-        const socket = this.io.sockets.sockets.get(socketId)
+    deliverMessage(listenerKey, message) {
+        const socketId = this.listenerKeyToSocket.get(listenerKey)
+        const socket = socketId ? this.io.sockets.sockets.get(socketId) : null
         if (!socket || !socket.connected) {
             return false
         }
@@ -195,7 +237,10 @@ class MessageQueue {
 
     // Acknowledge a message was received
     acknowledge(socketId, messageId) {
-        const queue = this.queues.get(socketId)
+        const listenerKey = this.socketToListenerKey.get(socketId)
+        if (!listenerKey) return false
+
+        const queue = this.queues.get(listenerKey)
         if (!queue) return false
 
         const message = queue.get(messageId)
@@ -207,8 +252,11 @@ class MessageQueue {
     }
 
     // Get pending messages for a listener (for recovery after reconnect)
-    getPendingMessages(socketId) {
-        const queue = this.queues.get(socketId)
+    getPendingMessages(socketId, connection = null) {
+        const listenerKey = this.resolveListenerKey(socketId, connection)
+        if (!listenerKey) return []
+
+        const queue = this.queues.get(listenerKey)
         if (!queue) return []
 
         return Array.from(queue.values())
@@ -216,10 +264,36 @@ class MessageQueue {
             .sort((a, b) => a.sequence - b.sequence)
     }
 
-    // Clean up listener's queue on disconnect
+    cancelScheduledCleanup(listenerKey) {
+        const timer = this.cleanupTimers.get(listenerKey)
+        if (!timer) return
+
+        clearTimeout(timer)
+        this.cleanupTimers.delete(listenerKey)
+    }
+
+    // Defer queue cleanup so reconnecting listeners can recover pending messages
+    scheduleListenerCleanup(socketId) {
+        const listenerKey = this.socketToListenerKey.get(socketId)
+        if (!listenerKey) return
+
+        this.socketToListenerKey.delete(socketId)
+        this.listenerKeyToSocket.delete(listenerKey)
+
+        if (this.cleanupTimers.has(listenerKey)) return
+
+        const timer = setTimeout(() => {
+            this.cleanupTimers.delete(listenerKey)
+            this.queues.delete(listenerKey)
+            this.sequenceNumbers.delete(listenerKey)
+        }, this.listenerCleanupGraceMs)
+
+        this.cleanupTimers.set(listenerKey, timer)
+    }
+
+    // Clean up listener's queue on disconnect (deferred grace period)
     cleanupListener(socketId) {
-        this.queues.delete(socketId)
-        this.sequenceNumbers.delete(socketId)
+        this.scheduleListenerCleanup(socketId)
     }
 
     // Retry loop for unacknowledged messages
@@ -227,7 +301,7 @@ class MessageQueue {
         setInterval(() => {
             const now = Date.now()
 
-            for (const [socketId, queue] of this.queues.entries()) {
+            for (const [listenerKey, queue] of this.queues.entries()) {
                 for (const [messageId, message] of queue.entries()) {
                     // Check if message has expired
                     if (now - message.timestamp > this.messageExpiry) {
@@ -240,7 +314,7 @@ class MessageQueue {
                         const timeSinceLastAttempt = now - (message.lastAttempt || message.timestamp)
                         if (timeSinceLastAttempt >= this.retryInterval) {
                             message.lastAttempt = now
-                            this.deliverMessage(socketId, message)
+                            this.deliverMessage(listenerKey, message)
                         }
                     } else if (message.attempts >= this.maxRetries) {
                         // Max retries reached, remove message
@@ -1259,6 +1333,9 @@ io.on('connection', async (socket) => {
         const connection = activeConnections.get(socket.id)
         if (connection) {
             connection.targetLanguage = data.targetLanguage
+            if (messageQueue && connection.sessionCode && data.targetLanguage) {
+                messageQueue.bindSocket(socket.id, connection.sessionCode, data.targetLanguage)
+            }
             emitConnectionCount(connection.sessionCode)
         }
     })
@@ -1273,7 +1350,8 @@ io.on('connection', async (socket) => {
     // Request missed messages after reconnection
     socket.on('requestMissedMessages', () => {
         if (messageQueue) {
-            const pendingMessages = messageQueue.getPendingMessages(socket.id)
+            const connection = activeConnections.get(socket.id)
+            const pendingMessages = messageQueue.getPendingMessages(socket.id, connection)
             if (pendingMessages.length > 0) {
                 pendingMessages.forEach(message => {
                     socket.emit('translationComplete', {
