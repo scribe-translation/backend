@@ -394,16 +394,12 @@ async function handleBackgroundProcessing(socketId, connectionData) {
     })();
 }
 
-const emitConnectionCount = (sessionCode = null) => {
+const buildConnectionDataForSession = (sessionCode) => {
     const connectionsByLanguage = {}
     let totalConnections = 0
 
     activeConnections.forEach((connection) => {
-        if (sessionCode && connection.sessionCode !== sessionCode) {
-            return
-        }
-
-        if (!connection.sessionCode) {
+        if (connection.sessionCode !== sessionCode) {
             return
         }
 
@@ -413,34 +409,43 @@ const emitConnectionCount = (sessionCode = null) => {
         }
     })
 
-    const connectionData = {
+    return {
+        sessionCode,
         total: totalConnections,
         byLanguage: connectionsByLanguage
     }
+}
 
+const emitConnectionCountToSession = (sessionCode) => {
+    if (!sessionCode) return
+
+    const connectionData = buildConnectionDataForSession(sessionCode)
+
+    activeConnections.forEach((conn, socketId) => {
+        if (conn.sessionCode !== sessionCode) return
+
+        const targetSocket = io.sockets.sockets.get(socketId)
+        if (targetSocket) {
+            targetSocket.emit('connectionCount', connectionData)
+        }
+    })
+}
+
+const emitConnectionCount = (sessionCode = null) => {
     if (sessionCode) {
-        const sessionCodeConnections = Array.from(activeConnections.entries())
-            .filter(([_, conn]) => conn.sessionCode === sessionCode)
-            .map(([socketId, _]) => socketId)
+        emitConnectionCountToSession(sessionCode)
+        return
+    }
 
+    const sessionCodes = new Set()
+    activeConnections.forEach((connection) => {
+        if (connection.sessionCode) {
+            sessionCodes.add(connection.sessionCode)
+        }
+    })
 
-        sessionCodeConnections.forEach(socketId => {
-            const targetSocket = io.sockets.sockets.get(socketId)
-            if (targetSocket) {
-                targetSocket.emit('connectionCount', connectionData)
-            }
-        })
-    } else {
-        const validConnections = Array.from(activeConnections.entries())
-            .filter(([_, conn]) => conn.sessionCode)
-            .map(([socketId, _]) => socketId)
-
-        validConnections.forEach(socketId => {
-            const targetSocket = io.sockets.sockets.get(socketId)
-            if (targetSocket) {
-                targetSocket.emit('connectionCount', connectionData)
-            }
-        })
+    for (const code of sessionCodes) {
+        emitConnectionCountToSession(code)
     }
 }
 
@@ -988,13 +993,9 @@ io.on('connection', async (socket) => {
                     }
                 }
             } else {
-                io.emit('transcriptionComplete', {
-                    transcription,
-                    sourceLanguage,
-                    bubbleId,
-                    userId: currentConnection?.userId,
-                    userEmail: currentConnection?.userEmail
-                })
+                console.warn(
+                    `⚠️ Skipping transcription broadcast — no sessionCode for socket ${socket.id}`
+                )
             }
 
         } catch (error) {
@@ -1244,13 +1245,9 @@ io.on('connection', async (socket) => {
                         }
                     }
                 } else {
-                    io.emit('transcriptionComplete', {
-                        transcription: finalTranscript,
-                        sourceLanguage,
-                        bubbleId,
-                        userId: currentConnection?.userId,
-                        userEmail: currentConnection?.userEmail
-                    })
+                    console.warn(
+                        `⚠️ Skipping transcription broadcast — no sessionCode for socket ${socket.id}`
+                    )
                 }
 
                 lastInterimBySocket.delete(socket.id)
@@ -1374,30 +1371,11 @@ io.on('connection', async (socket) => {
         const currentConnection = activeConnections.get(socket.id)
         const sessionCode = currentConnection?.sessionCode
 
-        const connectionsByLanguage = {}
-        let totalConnections = 0
-
-        activeConnections.forEach((connection) => {
-            if (sessionCode && connection.sessionCode !== sessionCode) {
-                return
-            }
-
-            if (!connection.sessionCode) {
-                return
-            }
-
-            totalConnections++
-            if (connection.targetLanguage) {
-                connectionsByLanguage[connection.targetLanguage] = (connectionsByLanguage[connection.targetLanguage] || 0) + 1
-            }
-        })
-
-        const connectionData = {
-            total: totalConnections,
-            byLanguage: connectionsByLanguage
+        if (!sessionCode) {
+            return
         }
 
-        socket.emit('connectionCount', connectionData)
+        socket.emit('connectionCount', buildConnectionDataForSession(sessionCode))
     })
 
     socket.on('disconnect', async () => {
