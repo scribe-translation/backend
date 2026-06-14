@@ -180,10 +180,17 @@ class MessageQueue {
     }
 
     // Queue a message for delivery to a specific listener
-    queueMessage(socketId, message) {
-        const listenerKey = this.socketToListenerKey.get(socketId)
+    queueMessage(socketId, message, connection = null) {
+        let listenerKey = this.socketToListenerKey.get(socketId)
         if (!listenerKey) {
-            console.warn(`⚠️ No listener key bound for socket ${socketId}, skipping queue`)
+            listenerKey = this.resolveListenerKey(socketId, connection)
+        }
+        if (!listenerKey) {
+            console.warn(`⚠️ No listener key bound for socket ${socketId}, skipping queue`, {
+                sessionCode: connection?.sessionCode ?? 'unknown',
+                targetLanguage: connection?.targetLanguage ?? 'unknown',
+                hasConnection: !!connection
+            })
             return null
         }
 
@@ -278,7 +285,10 @@ class MessageQueue {
         if (!listenerKey) return
 
         this.socketToListenerKey.delete(socketId)
-        this.listenerKeyToSocket.delete(listenerKey)
+        const currentOwner = this.listenerKeyToSocket.get(listenerKey)
+        if (currentOwner === socketId) {
+            this.listenerKeyToSocket.delete(listenerKey)
+        }
 
         if (this.cleanupTimers.has(listenerKey)) return
 
@@ -975,7 +985,7 @@ io.on('connection', async (socket) => {
                                         bubbleId,
                                         userId: currentConnection.userId,
                                         userEmail: currentConnection.userEmail
-                                    })
+                                    }, conn)
                                 }
                             }
                         }
@@ -1222,13 +1232,14 @@ io.on('connection', async (socket) => {
 
                             translations.filter(Boolean).forEach(({ socketId, translation, targetLanguage }) => {
                                 if (socketId && translation && messageQueue) {
+                                    const conn = activeConnections.get(socketId)
                                     messageQueue.queueMessage(socketId, {
                                         originalText: finalTranscript,
                                         translatedText: translation,
                                         sourceLanguage,
                                         targetLanguage,
                                         bubbleId
-                                    })
+                                    }, conn)
                                 }
                             })
                         } catch (translationError) {
@@ -1330,10 +1341,18 @@ io.on('connection', async (socket) => {
         const connection = activeConnections.get(socket.id)
         if (connection) {
             connection.targetLanguage = data.targetLanguage
+            let queueBound = false
             if (messageQueue && connection.sessionCode && data.targetLanguage) {
                 messageQueue.bindSocket(socket.id, connection.sessionCode, data.targetLanguage)
+                queueBound = messageQueue.socketToListenerKey.has(socket.id)
             }
             emitConnectionCount(connection.sessionCode)
+            socket.emit('targetLanguageConfirmed', {
+                socketId: socket.id,
+                sessionCode: connection.sessionCode,
+                targetLanguage: data.targetLanguage,
+                queueBound
+            })
         }
     })
 
@@ -1660,13 +1679,14 @@ async function handleFinalTranscription(socket, transcript, sourceLanguage, acti
 
             translations.filter(Boolean).forEach(({ socketId, translation, targetLanguage }) => {
                 if (socketId && translation && messageQueue) {
+                    const conn = activeConnections.get(socketId);
                     messageQueue.queueMessage(socketId, {
                         originalText: transcript,
                         translatedText: translation,
                         sourceLanguage,
                         targetLanguage,
                         bubbleId: activeBubbleId
-                    });
+                    }, conn);
                 }
             });
         } catch (translationError) {
