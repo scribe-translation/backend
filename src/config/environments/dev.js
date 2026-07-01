@@ -20,8 +20,8 @@ module.exports = {
   // Google Cloud Speech-to-Text
   GOOGLE_CLOUD_PROJECT_ID: process.env.GOOGLE_CLOUD_PROJECT_ID || 'scribe-471123',
   
-  // CORS
-  CORS_ORIGIN: 'http://speaker.localhost:5173,http://listener.localhost:5173,http://api.localhost:3001',
+  // CORS — include plain localhost/IP dev routes alongside subdomain hosts
+  CORS_ORIGIN: 'http://speaker.localhost:5173,http://listener.localhost:5173,http://localhost:5173,http://127.0.0.1:5173,http://api.localhost:3001',
   
   // Frontend URLs
   FRONTEND_URL: 'http://speaker.localhost:5173',
