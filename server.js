@@ -2,6 +2,7 @@ const express = require('express')
 const http = require('http')
 const socketIo = require('socket.io')
 const cors = require('cors')
+const crypto = require('crypto')
 const path = require('path')
 require('dotenv').config()
 const config = require('./src/config')
@@ -18,8 +19,28 @@ const { isSameLanguage } = require('./src/utils/languageCodeMapper')
 const app = express()
 const server = http.createServer(app)
 
+const corsOrigins = config.CORS_ORIGIN.split(',').map(origin => origin.trim())
+const isDevEnvironment = config.NODE_ENV === 'dev'
+
 app.use(cors({
-    origin: config.CORS_ORIGIN.split(',').map(origin => origin.trim()),
+    origin: (origin, callback) => {
+        if (!origin) {
+            callback(null, true)
+            return
+        }
+        if (isDevEnvironment) {
+            const devOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1|\d+\.\d+\.\d+\.\d+|[^.]+\.localhost)(:\d+)?$/
+            if (devOriginPattern.test(origin)) {
+                callback(null, true)
+                return
+            }
+        }
+        if (corsOrigins.includes(origin)) {
+            callback(null, true)
+            return
+        }
+        callback(new Error(`Not allowed by CORS: ${origin}`))
+    },
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -116,6 +137,157 @@ function cleanupContentHashes(socketId) {
     contentHashes.delete(socketId);
 }
 
+function isDuplicateFinal(socketId, bubbleId, transcript) {
+    const trimmed = (transcript || '').trim();
+    if (!trimmed) {
+        return true;
+    }
+
+    const contentHash = generateContentHash(trimmed);
+    const dedupeKey = bubbleId
+        ? `${socketId}:${bubbleId}:${contentHash}`
+        : `${socketId}:text:${contentHash}`;
+
+    const processedAt = processedTranscripts.get(dedupeKey);
+    return !!(processedAt && (Date.now() - processedAt) < CONTENT_HASH_EXPIRY);
+}
+
+function recordProcessedFinal(socketId, bubbleId, transcript) {
+    const trimmed = (transcript || '').trim();
+    if (!trimmed) {
+        return;
+    }
+
+    const contentHash = generateContentHash(trimmed);
+    const dedupeKey = bubbleId
+        ? `${socketId}:${bubbleId}:${contentHash}`
+        : `${socketId}:text:${contentHash}`;
+
+    processedTranscripts.set(dedupeKey, Date.now());
+}
+
+function getSessionConnectionIds(sessionCode) {
+    return Array.from(activeConnections.entries())
+        .filter(([_, conn]) => conn.sessionCode === sessionCode)
+        .map(([socketId, _]) => socketId);
+}
+
+function getTranslationConnectionIds(sessionCode) {
+    return getSessionConnectionIds(sessionCode).filter((socketId) => {
+        const conn = activeConnections.get(socketId);
+        return conn && !conn.isStreaming && conn.targetLanguage;
+    });
+}
+
+function getListenersByLanguage(sessionCode) {
+    const listenersByLanguage = new Map();
+
+    getTranslationConnectionIds(sessionCode).forEach((socketId) => {
+        const conn = activeConnections.get(socketId);
+        if (conn?.targetLanguage) {
+            if (!listenersByLanguage.has(conn.targetLanguage)) {
+                listenersByLanguage.set(conn.targetLanguage, []);
+            }
+            listenersByLanguage.get(conn.targetLanguage).push(socketId);
+        }
+    });
+
+    return listenersByLanguage;
+}
+
+async function processFinalTranscript({ socket, transcript, sourceLanguage, bubbleId, origin }) {
+    const trimmed = (transcript || '').trim();
+    if (!trimmed) {
+        return { processed: false, reason: 'empty' };
+    }
+
+    if (isDuplicateFinal(socket.id, bubbleId, trimmed)) {
+        console.log(`⏭️ Skipping duplicate final from ${origin} (socket=${socket.id}, bubble=${bubbleId || 'none'})`);
+        return { processed: false, reason: 'duplicate' };
+    }
+
+    recordProcessedFinal(socket.id, bubbleId, trimmed);
+
+    const currentConnection = activeConnections.get(socket.id);
+    if (!currentConnection?.sessionCode) {
+        console.warn(`⚠️ Skipping final transcript — no sessionCode for socket ${socket.id}`);
+        return { processed: false, reason: 'no_session' };
+    }
+
+    const currentText = sessionTranscripts.get(socket.id) || '';
+    sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + trimmed);
+
+    const sessionCode = currentConnection.sessionCode;
+    const sessionCodeConnections = getSessionConnectionIds(sessionCode);
+    const listenersByLanguage = getListenersByLanguage(sessionCode);
+
+    console.log(
+        `📝 Final transcript from ${origin}: "${trimmed.substring(0, 50)}${trimmed.length > 50 ? '...' : ''}" → ${listenersByLanguage.size} language(s)`
+    );
+
+    if (listenersByLanguage.size === 0) {
+        const sessionConnections = getSessionConnectionIds(sessionCode).map((socketId) => {
+            const conn = activeConnections.get(socketId);
+            return {
+                socketId,
+                isStreaming: !!conn?.isStreaming,
+                targetLanguage: conn?.targetLanguage || null
+            };
+        });
+        console.log(`⚠️ No listeners for session ${sessionCode}:`, sessionConnections);
+    }
+
+    sessionCodeConnections.forEach((socketId) => {
+        const targetSocket = io.sockets.sockets.get(socketId);
+        const conn = activeConnections.get(socketId);
+        if (targetSocket && conn?.userId) {
+            targetSocket.emit('transcriptionComplete', {
+                transcription: trimmed,
+                sourceLanguage,
+                bubbleId,
+                userId: currentConnection.userId,
+                userEmail: currentConnection.userEmail
+            });
+        }
+    });
+
+    if (listenersByLanguage.size > 0) {
+        try {
+            for (const [targetLanguage, listenerSocketIds] of listenersByLanguage) {
+                const translatedText = await processTranscription(trimmed, sourceLanguage, targetLanguage);
+
+                listenerSocketIds.forEach((socketId) => {
+                    const conn = activeConnections.get(socketId);
+                    if (conn && messageQueue) {
+                        messageQueue.queueMessage(socketId, {
+                            originalText: trimmed,
+                            translatedText,
+                            sourceLanguage,
+                            targetLanguage,
+                            bubbleId,
+                            userId: currentConnection.userId,
+                            userEmail: currentConnection.userEmail
+                        }, conn);
+                    }
+                });
+            }
+        } catch (translationError) {
+            console.error(`Translation error (${origin}):`, translationError);
+            getTranslationConnectionIds(sessionCode).forEach((socketId) => {
+                const targetSocket = io.sockets.sockets.get(socketId);
+                if (targetSocket) {
+                    targetSocket.emit('translationError', {
+                        message: 'Translation failed: ' + translationError.message,
+                        bubbleId
+                    });
+                }
+            });
+        }
+    }
+
+    return { processed: true, languages: listenersByLanguage.size };
+}
+
 // ============================================================================
 // MESSAGE QUEUE SYSTEM - Guaranteed Delivery with Acknowledgments
 // ============================================================================
@@ -137,19 +309,21 @@ class MessageQueue {
         this.startRetryLoop()
     }
 
-    static listenerKey(sessionCode, targetLanguage) {
-        return `${sessionCode}:${targetLanguage}`
+    static listenerKey(sessionCode, targetLanguage, socketId) {
+        return `${sessionCode}:${targetLanguage}:${socketId}`
     }
 
     bindSocket(socketId, sessionCode, targetLanguage) {
-        if (!sessionCode || !targetLanguage) return
+        if (!sessionCode || !targetLanguage || !socketId) return
 
-        const key = MessageQueue.listenerKey(sessionCode, targetLanguage)
+        const key = MessageQueue.listenerKey(sessionCode, targetLanguage, socketId)
         this.cancelScheduledCleanup(key)
 
-        const previousSocket = this.listenerKeyToSocket.get(key)
-        if (previousSocket && previousSocket !== socketId) {
-            this.socketToListenerKey.delete(previousSocket)
+        const previousKey = this.socketToListenerKey.get(socketId)
+        if (previousKey && previousKey !== key) {
+            if (this.listenerKeyToSocket.get(previousKey) === socketId) {
+                this.listenerKeyToSocket.delete(previousKey)
+            }
         }
 
         this.socketToListenerKey.set(socketId, key)
@@ -677,7 +851,8 @@ function createStreamCallbacks(socket) {
                         socket,
                         lastInterim,
                         sourceLanguage,
-                        activeBubbleId
+                        activeBubbleId,
+                        'forceFinalizeSafety'
                     )
                     lastInterimBySocket.delete(socket.id)
                 }
@@ -945,63 +1120,13 @@ io.on('connection', async (socket) => {
             emitConnectionCount(currentConnection?.sessionCode)
 
             if (currentConnection?.sessionCode) {
-                const sessionCodeConnections = Array.from(activeConnections.entries())
-                    .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
-                    .map(([socketId, _]) => socketId)
-
-                const translationConnections = sessionCodeConnections.filter(socketId => {
-                    const conn = activeConnections.get(socketId)
-                    return conn && !conn.isStreaming && conn.targetLanguage
+                await processFinalTranscript({
+                    socket,
+                    transcript: transcription,
+                    sourceLanguage,
+                    bubbleId,
+                    origin: 'speechTranscription'
                 })
-
-                sessionCodeConnections.forEach(socketId => {
-                    const targetSocket = io.sockets.sockets.get(socketId)
-                    const conn = activeConnections.get(socketId)
-                    if (targetSocket && conn?.userId) {
-                        targetSocket.emit('transcriptionComplete', {
-                            transcription,
-                            sourceLanguage,
-                            bubbleId,
-                            userId: currentConnection.userId,
-                            userEmail: currentConnection.userEmail
-                        })
-                    }
-                })
-
-                if (translationConnections.length > 0) {
-                    try {
-                        for (const socketId of translationConnections) {
-                            const conn = activeConnections.get(socketId)
-                            if (conn?.targetLanguage) {
-                                const translatedText = await processTranscription(transcription, sourceLanguage, conn.targetLanguage)
-
-                                // Use message queue for guaranteed delivery
-                                if (messageQueue) {
-                                    messageQueue.queueMessage(socketId, {
-                                        originalText: transcription,
-                                        translatedText,
-                                        sourceLanguage,
-                                        targetLanguage: conn.targetLanguage,
-                                        bubbleId,
-                                        userId: currentConnection.userId,
-                                        userEmail: currentConnection.userEmail
-                                    }, conn)
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Translation error:', error)
-                        translationConnections.forEach(socketId => {
-                            const targetSocket = io.sockets.sockets.get(socketId)
-                            if (targetSocket) {
-                                targetSocket.emit('translationError', {
-                                    error: 'Translation failed',
-                                    bubbleId
-                                })
-                            }
-                        })
-                    }
-                }
             } else {
                 console.warn(
                     `⚠️ Skipping transcription broadcast — no sessionCode for socket ${socket.id}`
@@ -1189,77 +1314,13 @@ io.on('connection', async (socket) => {
 
             // Handle manual finalization (when frontend sends final transcript)
             if (finalTranscript && isFinal && !audioData) {
-                if (currentConnection?.sessionCode) {
-                    const sessionCodeConnections = Array.from(activeConnections.entries())
-                        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
-                        .map(([socketId, _]) => socketId)
-
-                    const translationConnections = sessionCodeConnections.filter(socketId => {
-                        const conn = activeConnections.get(socketId)
-                        return conn && !conn.isStreaming && conn.targetLanguage
-                    })
-
-                    sessionCodeConnections.forEach(socketId => {
-                        const targetSocket = io.sockets.sockets.get(socketId)
-                        const conn = activeConnections.get(socketId)
-                        if (targetSocket && conn?.userId) {
-                            targetSocket.emit('transcriptionComplete', {
-                                transcription: finalTranscript,
-                                sourceLanguage,
-                                bubbleId,
-                                userId: currentConnection.userId,
-                                userEmail: currentConnection.userEmail
-                            })
-                        }
-                    })
-
-                    if (translationConnections.length > 0) {
-                        try {
-                            const translations = await Promise.all(
-                                translationConnections.map(async (socketId) => {
-                                    const conn = activeConnections.get(socketId)
-                                    if (conn?.targetLanguage) {
-                                        const translation = await processTranscription(
-                                            finalTranscript,
-                                            sourceLanguage,
-                                            conn.targetLanguage
-                                        )
-                                        return { socketId, translation, targetLanguage: conn.targetLanguage }
-                                    }
-                                    return null
-                                })
-                            )
-
-                            translations.filter(Boolean).forEach(({ socketId, translation, targetLanguage }) => {
-                                if (socketId && translation && messageQueue) {
-                                    const conn = activeConnections.get(socketId)
-                                    messageQueue.queueMessage(socketId, {
-                                        originalText: finalTranscript,
-                                        translatedText: translation,
-                                        sourceLanguage,
-                                        targetLanguage,
-                                        bubbleId
-                                    }, conn)
-                                }
-                            })
-                        } catch (translationError) {
-                            console.error('Translation error:', translationError)
-                            translationConnections.forEach(socketId => {
-                                const targetSocket = io.sockets.sockets.get(socketId)
-                                if (targetSocket) {
-                                    targetSocket.emit('translationError', {
-                                        message: 'Translation failed: ' + translationError.message,
-                                        bubbleId
-                                    })
-                                }
-                            })
-                        }
-                    }
-                } else {
-                    console.warn(
-                        `⚠️ Skipping transcription broadcast — no sessionCode for socket ${socket.id}`
-                    )
-                }
+                await processFinalTranscript({
+                    socket,
+                    transcript: finalTranscript,
+                    sourceLanguage,
+                    bubbleId,
+                    origin: 'manualFinal'
+                })
 
                 lastInterimBySocket.delete(socket.id)
                 if (speechToTextService.isRotationArmed(socket.id)) {
@@ -1341,11 +1402,16 @@ io.on('connection', async (socket) => {
         const connection = activeConnections.get(socket.id)
         if (connection) {
             connection.targetLanguage = data.targetLanguage
+            connection.isStreaming = false
             let queueBound = false
             if (messageQueue && connection.sessionCode && data.targetLanguage) {
                 messageQueue.bindSocket(socket.id, connection.sessionCode, data.targetLanguage)
                 queueBound = messageQueue.socketToListenerKey.has(socket.id)
             }
+            const listenerCount = getTranslationConnectionIds(connection.sessionCode).length
+            console.log(
+                `👂 Listener registered: ${socket.id} → ${data.targetLanguage} (session=${connection.sessionCode}, listeners=${listenerCount})`
+            )
             emitConnectionCount(connection.sessionCode)
             socket.emit('targetLanguageConfirmed', {
                 socketId: socket.id,
@@ -1353,6 +1419,18 @@ io.on('connection', async (socket) => {
                 targetLanguage: data.targetLanguage,
                 queueBound
             })
+        }
+    })
+
+    socket.on('clearTargetLanguage', () => {
+        const connection = activeConnections.get(socket.id)
+        if (connection) {
+            connection.targetLanguage = null
+            if (messageQueue) {
+                messageQueue.cleanupListener(socket.id)
+            }
+            console.log(`👂 Listener unregistered: ${socket.id} (session=${connection.sessionCode})`)
+            emitConnectionCount(connection.sessionCode)
         }
     })
 
@@ -1454,7 +1532,7 @@ io.on('connection', async (socket) => {
         }
 
         // Clean up processed transcripts for this socket
-        const socketPrefix = `${socket.id}-`;
+        const socketPrefix = `${socket.id}:`;
         for (const [key, _] of processedTranscripts.entries()) {
             if (key.startsWith(socketPrefix)) {
                 processedTranscripts.delete(key);
@@ -1530,27 +1608,10 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
     const currentConnection = activeConnections.get(socket.id);
     if (!currentConnection?.sessionCode) return;
 
-    const sessionCodeConnections = Array.from(activeConnections.entries())
-        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
-        .map(([socketId, _]) => socketId);
+    const listenersByLanguage = getListenersByLanguage(currentConnection.sessionCode);
+    if (listenersByLanguage.size === 0) return;
 
-    const translationConnections = sessionCodeConnections.filter(socketId => {
-        const conn = activeConnections.get(socketId);
-        return conn && !conn.isStreaming && conn.targetLanguage;
-    });
-
-    if (translationConnections.length === 0) return;
-
-    const listenersByLanguage = new Map();
-    translationConnections.forEach(socketId => {
-        const conn = activeConnections.get(socketId);
-        if (conn?.targetLanguage) {
-            if (!listenersByLanguage.has(conn.targetLanguage)) {
-                listenersByLanguage.set(conn.targetLanguage, []);
-            }
-            listenersByLanguage.get(conn.targetLanguage).push(socketId);
-        }
-    });
+    const translationConnections = getTranslationConnectionIds(currentConnection.sessionCode);
 
     if (!interimTranslationThrottle.has(socket.id)) {
         interimTranslationThrottle.set(socket.id, new Map());
@@ -1626,82 +1687,14 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
 }
 
 // Helper function to handle final transcription processing (translation and delivery)
-async function handleFinalTranscription(socket, transcript, sourceLanguage, activeBubbleId) {
-    // Accumulate the transcript
-    const currentText = sessionTranscripts.get(socket.id) || '';
-    sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + transcript);
-
-    const currentConnection = activeConnections.get(socket.id);
-    if (!currentConnection?.sessionCode) return;
-
-    const sessionCodeConnections = Array.from(activeConnections.entries())
-        .filter(([_, conn]) => conn.sessionCode === currentConnection.sessionCode)
-        .map(([socketId, _]) => socketId);
-
-    const translationConnections = sessionCodeConnections.filter(socketId => {
-        const conn = activeConnections.get(socketId);
-        return conn && !conn.isStreaming && conn.targetLanguage;
+async function handleFinalTranscription(socket, transcript, sourceLanguage, activeBubbleId, origin = 'sttFinal') {
+    return processFinalTranscript({
+        socket,
+        transcript,
+        sourceLanguage,
+        bubbleId: activeBubbleId,
+        origin
     });
-
-
-    // Send transcription to input clients
-    sessionCodeConnections.forEach(socketId => {
-        const targetSocket = io.sockets.sockets.get(socketId);
-        const conn = activeConnections.get(socketId);
-        if (targetSocket && conn?.userId) {
-            targetSocket.emit('transcriptionComplete', {
-                transcription: transcript,
-                sourceLanguage,
-                bubbleId: activeBubbleId,
-                userId: currentConnection.userId,
-                userEmail: currentConnection.userEmail
-            });
-        }
-    });
-
-    // Process translations
-    if (translationConnections.length > 0) {
-        try {
-            const translations = await Promise.all(
-                translationConnections.map(async (socketId) => {
-                    const conn = activeConnections.get(socketId);
-                    if (conn?.targetLanguage) {
-                        const translation = await processTranscription(
-                            transcript,
-                            sourceLanguage,
-                            conn.targetLanguage
-                        );
-                        return { socketId, translation, targetLanguage: conn.targetLanguage };
-                    }
-                    return null;
-                })
-            );
-
-            translations.filter(Boolean).forEach(({ socketId, translation, targetLanguage }) => {
-                if (socketId && translation && messageQueue) {
-                    const conn = activeConnections.get(socketId);
-                    messageQueue.queueMessage(socketId, {
-                        originalText: transcript,
-                        translatedText: translation,
-                        sourceLanguage,
-                        targetLanguage,
-                        bubbleId: activeBubbleId
-                    }, conn);
-                }
-            });
-        } catch (translationError) {
-            console.error('Translation error:', translationError);
-            translationConnections.forEach(socketId => {
-                const targetSocket = io.sockets.sockets.get(socketId);
-                if (targetSocket) {
-                    targetSocket.emit('translationError', {
-                        message: 'Translation failed: ' + translationError.message,
-                        bubbleId: activeBubbleId
-                    });
-                }
-            });
-        }
-    }
 }
 
 async function processTranscription(transcription, sourceLanguage, targetLanguage) {
