@@ -10,6 +10,7 @@ const { authenticateSocket, authenticateToken } = require('./src/middleware/auth
 const authRoutes = require('./src/routes/auth')
 const User = require('./src/models/User')
 const Session = require('./src/models/Session')
+const AppSettings = require('./src/models/AppSettings')
 const { initFirestore } = require('./src/database/firestore')
 const speechToTextService = require('./src/services/speechToTextService')
 const googleTranslationService = require('./src/services/googleTranslationService')
@@ -1612,58 +1613,72 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
     if (listenersByLanguage.size === 0) return;
 
     const translationConnections = getTranslationConnectionIds(currentConnection.sessionCode);
+    const interimTranslationEnabled = await AppSettings.isInterimTranslationEnabled();
 
-    if (!interimTranslationThrottle.has(socket.id)) {
-        interimTranslationThrottle.set(socket.id, new Map());
-    }
-    const speakerThrottle = interimTranslationThrottle.get(socket.id);
-
-    // Process each unique target language
-    for (const [targetLanguage, listenerSocketIds] of listenersByLanguage) {
-        let textToSend = interimText;
-        let translatedText = null;
-
-        if (isSameLanguage(sourceLanguage, targetLanguage)) {
-            textToSend = interimText;
-        } else {
-            const throttleEntry = speakerThrottle.get(targetLanguage);
-            const now = Date.now();
-
-            if (throttleEntry && (now - throttleEntry.timestamp) < INTERIM_THROTTLE_MS) {
-                translatedText = throttleEntry.translatedText;
-                textToSend = translatedText || interimText;
-            } else {
-                // Throttle expired or first request -> translate
-                try {
-                    translatedText = await googleTranslationService.translateText(
-                        interimText,
-                        sourceLanguage,
-                        targetLanguage
-                    );
-                    textToSend = translatedText;
-
-                    speakerThrottle.set(targetLanguage, {
-                        timestamp: now,
-                        translatedText: translatedText
-                    });
-                } catch (error) {
-                    console.error(`❌ Interim translation error (${sourceLanguage} → ${targetLanguage}):`, error.message);
-                    textToSend = interimText;
-                }
-            }
-        }
-
-        listenerSocketIds.forEach(socketId => {
+    if (!interimTranslationEnabled) {
+        // Cost gate: signal typing without translating interim text
+        translationConnections.forEach(socketId => {
             const targetSocket = io.sockets.sockets.get(socketId);
             if (targetSocket) {
                 targetSocket.emit('speakerTyping', {
                     isTyping: true,
-                    interimText: interimText,
-                    translatedInterimText: translatedText || textToSend,
                     sourceLanguage: sourceLanguage
                 });
             }
         });
+    } else {
+        if (!interimTranslationThrottle.has(socket.id)) {
+            interimTranslationThrottle.set(socket.id, new Map());
+        }
+        const speakerThrottle = interimTranslationThrottle.get(socket.id);
+
+        // Process each unique target language
+        for (const [targetLanguage, listenerSocketIds] of listenersByLanguage) {
+            let textToSend = interimText;
+            let translatedText = null;
+
+            if (isSameLanguage(sourceLanguage, targetLanguage)) {
+                textToSend = interimText;
+            } else {
+                const throttleEntry = speakerThrottle.get(targetLanguage);
+                const now = Date.now();
+
+                if (throttleEntry && (now - throttleEntry.timestamp) < INTERIM_THROTTLE_MS) {
+                    translatedText = throttleEntry.translatedText;
+                    textToSend = translatedText || interimText;
+                } else {
+                    // Throttle expired or first request -> translate
+                    try {
+                        translatedText = await googleTranslationService.translateText(
+                            interimText,
+                            sourceLanguage,
+                            targetLanguage
+                        );
+                        textToSend = translatedText;
+
+                        speakerThrottle.set(targetLanguage, {
+                            timestamp: now,
+                            translatedText: translatedText
+                        });
+                    } catch (error) {
+                        console.error(`❌ Interim translation error (${sourceLanguage} → ${targetLanguage}):`, error.message);
+                        textToSend = interimText;
+                    }
+                }
+            }
+
+            listenerSocketIds.forEach(socketId => {
+                const targetSocket = io.sockets.sockets.get(socketId);
+                if (targetSocket) {
+                    targetSocket.emit('speakerTyping', {
+                        isTyping: true,
+                        interimText: interimText,
+                        translatedInterimText: translatedText || textToSend,
+                        sourceLanguage: sourceLanguage
+                    });
+                }
+            });
+        }
     }
 
     // Clear existing timeout for this socket
@@ -1845,6 +1860,7 @@ const startServer = async () => {
         try {
             await initFirestore()
             console.log('✅ Firestore initialized')
+            await AppSettings.ensureDefaults()
         } catch (dbError) {
             console.error('❌ Firestore initialization failed:', dbError.message)
             console.log('⚠️ Server will continue but database features may not work')

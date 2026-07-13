@@ -86,6 +86,7 @@ const Collections = {
   USERS: 'users',
   SESSIONS: 'sessions',
   PASSWORD_RESET_TOKENS: 'passwordResetTokens',
+  SETTINGS: 'settings',
 };
 
 /**
