@@ -38,6 +38,44 @@ class AppSettings {
     }
   }
 
+  static async getAll() {
+    try {
+      const db = getDb();
+      const snapshot = await db.collection(Collections.SETTINGS).doc(DOC_ID).get();
+      const data = snapshot.exists ? snapshot.data() : {};
+      return {
+        interimTranslationEnabled: data?.interimTranslationEnabled === true,
+        updatedAt: data?.updatedAt?.toDate?.() ?? null,
+      };
+    } catch (error) {
+      console.error('Error reading app settings:', error.message);
+      throw error;
+    }
+  }
+
+  static async update(partial) {
+    try {
+      const db = getDb();
+      const docRef = db.collection(Collections.SETTINGS).doc(DOC_ID);
+      const updates = {
+        updatedAt: dateToTimestamp(new Date()),
+      };
+
+      if (partial.interimTranslationEnabled !== undefined) {
+        updates.interimTranslationEnabled = partial.interimTranslationEnabled === true;
+      }
+
+      await docRef.set(updates, { merge: true });
+
+      cache = { interimTranslationEnabled: false, expiresAt: 0 };
+
+      return AppSettings.getAll();
+    } catch (error) {
+      console.error('Error updating app settings:', error.message);
+      throw error;
+    }
+  }
+
   /**
    * Read interimTranslationEnabled with a short in-memory cache.
    * Fail closed (false) on read errors so interim translation stays off under cost pressure.

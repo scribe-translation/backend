@@ -6,8 +6,10 @@ const crypto = require('crypto')
 const path = require('path')
 require('dotenv').config()
 const config = require('./src/config')
-const { authenticateSocket, authenticateToken } = require('./src/middleware/auth')
+const { authenticateSocket, authenticateToken, requireAdmin } = require('./src/middleware/auth')
 const authRoutes = require('./src/routes/auth')
+const adminRoutes = require('./src/routes/admin')
+const { registerActiveConnections } = require('./src/services/connectionRegistry')
 const User = require('./src/models/User')
 const Session = require('./src/models/Session')
 const AppSettings = require('./src/models/AppSettings')
@@ -42,7 +44,7 @@ app.use(cors({
         }
         callback(new Error(`Not allowed by CORS: ${origin}`))
     },
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
     optionsSuccessStatus: 200
@@ -51,7 +53,7 @@ app.use(cors({
 const io = socketIo(server, {
     cors: {
         origin: true,
-        methods: ["GET", "POST", "DELETE", "OPTIONS"],
+        methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         credentials: true,
         allowedHeaders: ["Content-Type", "Authorization"],
         optionsSuccessStatus: 200
@@ -66,8 +68,10 @@ app.use(express.json({ limit: '50mb' }))
 app.use(express.static(path.join(__dirname, 'public')))
 
 app.use('/auth', authRoutes)
+app.use('/admin', authenticateToken, requireAdmin, adminRoutes)
 
 const activeConnections = new Map()
+registerActiveConnections(activeConnections)
 let audioChunkCounter = 0
 const streamingSessions = new Map() // Track streaming sessions per socket
 const sessionTranscripts = new Map() // Accumulate transcripts for the current session per socket

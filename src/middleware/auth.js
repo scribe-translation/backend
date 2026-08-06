@@ -5,6 +5,25 @@ const config = require('../config');
 
 const JWT_SECRET = config.JWT_SECRET;
 
+const isAdminEmail = (email) => {
+  if (!email || !config.ADMIN_EMAILS?.length) return false;
+  return config.ADMIN_EMAILS.includes(String(email).trim().toLowerCase());
+};
+
+/**
+ * Restrict route to admin allowlist (requires authenticateToken first).
+ */
+const requireAdmin = (req, res, next) => {
+  if (!req.user || !isAdminEmail(req.user.email)) {
+    return res.status(403).json({
+      error: 'Admin access required',
+      code: 'ADMIN_REQUIRED',
+    });
+  }
+  req.user.isAdmin = true;
+  next();
+};
+
 /**
  * Middleware to authenticate JWT tokens
  */
@@ -231,5 +250,7 @@ module.exports = {
   generateToken,
   generateRefreshToken,
   verifyRefreshToken,
-  optionalAuth
+  optionalAuth,
+  isAdminEmail,
+  requireAdmin,
 };

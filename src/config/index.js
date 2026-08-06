@@ -38,6 +38,10 @@ const finalConfig = {
   TRANSLATION_URL: process.env.TRANSLATION_URL || config.TRANSLATION_URL,
   LOG_LEVEL: process.env.LOG_LEVEL || config.LOG_LEVEL,
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || config.GEMINI_API_KEY,
+  ADMIN_EMAILS: (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean),
 };
 
 if (environment === 'prod') {

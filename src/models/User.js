@@ -198,13 +198,50 @@ class User {
           id: doc.id,
           name: data.name,
           email: data.email,
-          isActive: data.isActive,
+          isActive: data.isActive !== false,
+          sessionCode: User.resolveSessionCodeFromData(data),
+          totpEnabled: data.totpEnabled === true,
+          totalUsageMinutes: data.totalUsageMinutes || 0,
+          totalSessions: data.totalSessions || 0,
+          lastActiveAt: timestampToDate(data.lastActiveAt),
           createdAt: timestampToDate(data.createdAt),
           updatedAt: timestampToDate(data.updatedAt),
         };
       });
     } catch (error) {
       console.error('Error getting all users:', error);
+      throw error;
+    }
+  }
+
+  static async getAdminStats() {
+    const users = await User.getAllUsers();
+    const activeUsers = users.filter((u) => u.isActive).length;
+    const totalUsageMinutes = users.reduce((sum, u) => sum + (u.totalUsageMinutes || 0), 0);
+    return {
+      totalUsers: users.length,
+      activeUsers,
+      totalUsageMinutes: Math.round(totalUsageMinutes * 10) / 10,
+    };
+  }
+
+  static async reactivateUser(id) {
+    try {
+      const db = getDb();
+      const docRef = db.collection(Collections.USERS).doc(id);
+
+      await docRef.update({
+        isActive: true,
+        updatedAt: dateToTimestamp(new Date()),
+      });
+
+      const updatedDoc = await docRef.get();
+      return new User({
+        id: updatedDoc.id,
+        ...updatedDoc.data(),
+      });
+    } catch (error) {
+      console.error('Error reactivating user:', error);
       throw error;
     }
   }

@@ -137,6 +137,37 @@ class Session {
     }
   }
 
+  static async findForAdmin({ userId, limit = 50, startDate, endDate }) {
+    try {
+      const db = getDb();
+      const snapshot = await db
+        .collection(Collections.SESSIONS)
+        .where('userId', '==', userId)
+        .orderBy('createdAt', 'desc')
+        .limit(Math.min(limit * 3, 200))
+        .get();
+
+      let sessions = snapshot.docs.map(doc => new Session({
+        id: doc.id,
+        ...doc.data(),
+      }));
+
+      if (startDate) {
+        const start = new Date(startDate).getTime();
+        sessions = sessions.filter((s) => s.createdAt && s.createdAt.getTime() >= start);
+      }
+      if (endDate) {
+        const end = new Date(endDate).getTime();
+        sessions = sessions.filter((s) => s.createdAt && s.createdAt.getTime() <= end);
+      }
+
+      return sessions.slice(0, limit);
+    } catch (error) {
+      console.error('Error finding sessions for admin:', error);
+      throw error;
+    }
+  }
+
   static async deactivate(sessionId) {
     try {
       const db = getDb();
