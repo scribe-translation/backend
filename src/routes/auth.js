@@ -7,10 +7,25 @@ const bcrypt = require('bcrypt');
 const User = require('../models/User');
 const PasswordResetToken = require('../models/PasswordResetToken');
 const emailService = require('../services/emailService');
-const { generateToken, generateRefreshToken, authenticateToken } = require('../middleware/auth');
+const { generateToken, generateRefreshToken, authenticateToken, isAdminEmail } = require('../middleware/auth');
 const config = require('../config');
 
 const router = express.Router();
+
+const serializeUser = (user, extras = {}) => ({
+  id: user.id,
+  email: user.email,
+  name: user.name,
+  sessionCode: user.sessionCode,
+  userCode: user.sessionCode,
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt,
+  totpEnabled: user.totpEnabled,
+  totalSessions: user.totalSessions || 0,
+  totalUsageMinutes: user.totalUsageMinutes || 0,
+  isAdmin: isAdminEmail(user.email),
+  ...extras,
+});
 
 const validateRegistration = [
   body('email')
@@ -249,14 +264,7 @@ router.post('/register', validateRegistration, async (req, res) => {
 
     res.status(201).json({
       message: 'User registered successfully',
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        sessionCode: sessionCode,
-        userCode: sessionCode, // backward compat
-        createdAt: user.createdAt
-      },
+      user: serializeUser(user, { sessionCode, userCode: sessionCode }),
       tokens: {
         accessToken,
         refreshToken
@@ -339,17 +347,7 @@ router.post('/login', validateLogin, async (req, res) => {
 
     res.json({
       message: 'Login successful',
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        sessionCode: sessionCode,
-        userCode: sessionCode, // backward compat
-        createdAt: user.createdAt,
-        totpEnabled: user.totpEnabled,
-        totalSessions: user.totalSessions || 0,
-        totalUsageMinutes: user.totalUsageMinutes || 0
-      },
+      user: serializeUser(user, { sessionCode, userCode: sessionCode }),
       tokens: {
         accessToken,
         refreshToken
@@ -439,18 +437,7 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 
     res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        sessionCode: user.sessionCode,
-        userCode: user.sessionCode, // backward compat
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-        totpEnabled: user.totpEnabled,
-        totalSessions: user.totalSessions || 0,
-        totalUsageMinutes: user.totalUsageMinutes || 0
-      }
+      user: serializeUser(user),
     });
   } catch (error) {
     console.error('Get user profile error:', error.message);

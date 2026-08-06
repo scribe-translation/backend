@@ -51,6 +51,16 @@ This backend connects to the Tongues frontend service via WebSocket. The fronten
 ### Languages
 - `GET /api/languages` - List of supported languages
 
+### Admin (requires JWT + `ADMIN_EMAILS` allowlist)
+- `GET /admin/stats` - Aggregate user and live connection metrics
+- `GET /admin/users` - All users with usage stats
+- `PATCH /admin/users/:id` - Deactivate/reactivate or clear session code
+- `GET /admin/live-connections` - Current WebSocket connections
+- `GET /admin/sessions?email=` - Transcript history for a user
+- `GET /admin/settings` / `PATCH /admin/settings` - Global app flags
+
+Set `ADMIN_EMAILS=you@example.com` in the backend environment (comma-separated for multiple admins). The speaker frontend shows an admin link at `/admin` only when the logged-in user's email is on the allowlist.
+
 ## 🔌 WebSocket Events
 
 ### Client to Server
