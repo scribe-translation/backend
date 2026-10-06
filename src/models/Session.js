@@ -21,15 +21,16 @@ class Session {
       const sessionsRef = db.collection(Collections.SESSIONS);
       
       const now = dateToTimestamp(new Date());
+      const fullText = sessionData.fullText || '';
       const newSession = {
         userId: sessionData.userId,
-        fullText: sessionData.fullText,
+        fullText,
         summary: sessionData.summary || null,
         facebookPost: sessionData.facebookPost || null,
         sourceLanguage: sessionData.sourceLanguage || 'en-US',
         createdAt: now,
         updatedAt: now,
-        characterCount: sessionData.characterCount || 0,
+        characterCount: sessionData.characterCount ?? fullText.length,
         isActive: true,
       };
 
@@ -69,21 +70,27 @@ class Session {
       const db = getDb();
       const sessionsRef = db.collection(Collections.SESSIONS);
       
+      // Single-field query avoids requiring a composite index; filter/sort in memory.
       const snapshot = await sessionsRef
         .where('userId', '==', userId)
-        .where('isActive', '==', true)
-        .orderBy('createdAt', 'desc')
-        .limit(limit)
         .get();
 
       if (snapshot.empty) {
         return [];
       }
 
-      return snapshot.docs.map(doc => new Session({
-        id: doc.id,
-        ...doc.data(),
-      }));
+      return snapshot.docs
+        .map(doc => new Session({
+          id: doc.id,
+          ...doc.data(),
+        }))
+        .filter(session => session.isActive !== false)
+        .sort((a, b) => {
+          const aTime = a.createdAt ? a.createdAt.getTime() : 0;
+          const bTime = b.createdAt ? b.createdAt.getTime() : 0;
+          return bTime - aTime;
+        })
+        .slice(0, limit);
     } catch (error) {
       console.error('❌ Error finding sessions by user:', error);
       throw error;
@@ -140,17 +147,22 @@ class Session {
   static async findForAdmin({ userId, limit = 50, startDate, endDate }) {
     try {
       const db = getDb();
+      // Single-field query avoids requiring a composite index; filter/sort in memory.
       const snapshot = await db
         .collection(Collections.SESSIONS)
         .where('userId', '==', userId)
-        .orderBy('createdAt', 'desc')
-        .limit(Math.min(limit * 3, 200))
         .get();
 
       let sessions = snapshot.docs.map(doc => new Session({
         id: doc.id,
         ...doc.data(),
       }));
+
+      sessions.sort((a, b) => {
+        const aTime = a.createdAt ? a.createdAt.getTime() : 0;
+        const bTime = b.createdAt ? b.createdAt.getTime() : 0;
+        return bTime - aTime;
+      });
 
       if (startDate) {
         const start = new Date(startDate).getTime();
