@@ -23,7 +23,8 @@ async function testSessionFlow() {
     const session = await Session.create({
       userId: user.id,
       fullText: sampleTranscript,
-      sourceLanguage: 'en-US'
+      sourceLanguage: 'en-US',
+      characterCount: sampleTranscript.length
     });
     console.log(`✅ Session saved successfully with ID: ${session.id}`);
 
@@ -31,30 +32,24 @@ async function testSessionFlow() {
     // The API key is likely not set for Gemini in this environment unless the user set it up,
     // so we'll just test that the wrapper handles errors gracefully if uninitialized
     let summary = null;
-    let facebookPost = null;
     if (aiService.isInitialized) {
       console.log('   Generating Summary...');
       summary = await aiService.generateSummary(sampleTranscript);
       console.log(`   Result: ${summary?.substring(0, 50)}...`);
-
-      console.log('   Generating Facebook Post...');
-      facebookPost = await aiService.generateFacebookPost(sampleTranscript);
-      console.log(`   Result: ${facebookPost?.substring(0, 50)}...`);
     } else {
       console.log('   Skipping AI generation (GEMINI_API_KEY not set).');
     }
 
     console.log('5. Updating Session with AI results...');
     const updatedSession = await Session.update(session.id, {
-      summary: summary || null,
-      facebookPost: facebookPost || null
+      summary: summary || null
     });
 
     console.log('✅ Final Session object:', {
       id: updatedSession.id,
       fullTextPreview: updatedSession.fullText.substring(0, 30) + '...',
-      hasSummary: !!updatedSession.summary,
-      hasFacebookPost: !!updatedSession.facebookPost
+      characterCount: updatedSession.characterCount,
+      hasSummary: !!updatedSession.summary
     });
 
     console.log('\n🎉 Test completed successfully!');

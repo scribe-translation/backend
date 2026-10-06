@@ -211,16 +211,20 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
         return { processed: false, reason: 'duplicate' };
     }
 
+    // Always buffer for storage before any sessionCode check — missing sessionCode
+    // must not prevent history saves, and must not mark the phrase as processed first.
+    // Join bubbles with newlines so history/PDF stay readable as one phrase per line.
+    const currentText = sessionTranscripts.get(socket.id) || '';
+    sessionTranscripts.set(socket.id, currentText + (currentText ? '\n' : '') + trimmed);
     recordProcessedFinal(socket.id, bubbleId, trimmed);
 
     const currentConnection = activeConnections.get(socket.id);
     if (!currentConnection?.sessionCode) {
-        console.warn(`⚠️ Skipping final transcript — no sessionCode for socket ${socket.id}`);
-        return { processed: false, reason: 'no_session' };
+        console.warn(
+            `⚠️ Buffered final without sessionCode for socket ${socket.id} (storage only, no broadcast)`
+        );
+        return { processed: true, languages: 0, broadcast: false };
     }
-
-    const currentText = sessionTranscripts.get(socket.id) || '';
-    sessionTranscripts.set(socket.id, currentText + (currentText ? ' ' : '') + trimmed);
 
     const sessionCode = currentConnection.sessionCode;
     const sessionCodeConnections = getSessionConnectionIds(sessionCode);
@@ -519,65 +523,68 @@ class MessageQueue {
 let messageQueue = null
 
 async function handleBackgroundProcessing(socketId, connectionData) {
-    let accumulatedText = sessionTranscripts.get(socketId);
-    sessionTranscripts.delete(socketId);
+    const accumulatedText = sessionTranscripts.get(socketId);
 
     // Default to opt-in if not specified (for backward compatibility)
-    const prefs = connectionData.recordingPrefs || {
+    const prefs = connectionData?.recordingPrefs || {
         storeText: true,
-        generateSummary: true,
-        generateFacebookPost: true
+        generateSummary: true
     };
 
-    if (!accumulatedText || accumulatedText.trim().length === 0 || !connectionData || !connectionData.userId || !prefs.storeText) {
-        if (!prefs.storeText) {
-            console.log(`ℹ️ Skipping transcription storage for user ${connectionData.userId} (user opted out)`);
-        }
+    if (!accumulatedText || accumulatedText.trim().length === 0) {
+        sessionTranscripts.delete(socketId);
         return;
     }
 
-    // Fire-and-forget background processing
+    if (!connectionData?.userId) {
+        console.log(`ℹ️ Skipping transcription storage for socket ${socketId} (no userId; buffer retained)`);
+        return;
+    }
+
+    if (!prefs.storeText) {
+        console.log(`ℹ️ Skipping transcription storage for user ${connectionData.userId} (user opted out)`);
+        sessionTranscripts.delete(socketId);
+        return;
+    }
+
+    // Claim buffer immediately so concurrent stop/disconnect cannot double-write.
+    // Restore on failure so a later cleanup can retry.
+    sessionTranscripts.delete(socketId);
+
     (async () => {
         try {
             console.log(`📝 Processing transcription background task for user ${connectionData.userId}...`);
 
-            // Save to database
             const sessionData = await Session.create({
                 userId: connectionData.userId,
                 fullText: accumulatedText,
-                sourceLanguage: connectionData.sourceLanguage || 'en-US'
+                sourceLanguage: connectionData.sourceLanguage || 'en-US',
+                characterCount: accumulatedText.length
             });
 
-            // Generate AI Content based on preferences
-            const aiTasks = [];
+            let summary = null;
             if (prefs.generateSummary) {
-                aiTasks.push(aiService.generateSummary(accumulatedText));
-            } else {
-                aiTasks.push(Promise.resolve(null));
+                try {
+                    summary = await aiService.generateSummary(accumulatedText);
+                } catch (e) {
+                    console.error('⚠️ AI generation error ignored in background task:', e);
+                }
             }
 
-            if (prefs.generateFacebookPost) {
-                aiTasks.push(aiService.generateFacebookPost(accumulatedText));
-            } else {
-                aiTasks.push(Promise.resolve(null));
-            }
-
-            const [summary, facebookPost] = await Promise.all(aiTasks.map(p => p.catch(e => {
-                console.error('⚠️ AI generation error ignored in background task:', e);
-                return null;
-            })));
-
-            // Update session with AI content if generated
-            if (summary || facebookPost) {
+            if (summary) {
                 await Session.update(sessionData.id, {
-                    summary: summary || null,
-                    facebookPost: facebookPost || null
+                    summary
                 });
                 console.log(`✅ Transcription processed and updated with AI for ${connectionData.userId}`);
             } else {
                 console.log(`✅ Transcription saved without AI content for ${connectionData.userId}`);
             }
         } catch (error) {
+            const existing = sessionTranscripts.get(socketId) || '';
+            sessionTranscripts.set(
+                socketId,
+                existing ? `${existing}\n${accumulatedText}` : accumulatedText
+            );
             console.error(`❌ Background processing failed for ${connectionData.userId}:`, error.message);
         }
     })();
@@ -916,6 +923,10 @@ io.on('connection', async (socket) => {
         console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for ${identifier}`);
         staleConnections.forEach(socketId => {
             console.log(`  - Removing stale socket: ${socketId}`);
+            const conn = activeConnections.get(socketId);
+            if (conn) {
+                handleBackgroundProcessing(socketId, conn);
+            }
             // Clean up all associated state
             const recognizeStream = streamingSessions.get(socketId);
             if (recognizeStream) {
@@ -1084,8 +1095,7 @@ io.on('connection', async (socket) => {
         if (connection) {
             connection.recordingPrefs = {
                 storeText: !!prefs.storeText,
-                generateSummary: !!prefs.generateSummary,
-                generateFacebookPost: !!prefs.generateFacebookPost
+                generateSummary: !!prefs.generateSummary
             };
             console.log(`⚙️ Updated recording prefs for ${socket.id}:`, connection.recordingPrefs);
         }
@@ -1581,6 +1591,10 @@ setInterval(() => {
         orphanedConnections.forEach(socketId => {
             const conn = activeConnections.get(socketId);
             console.log(`  - Removing orphan: ${socketId} (user: ${conn?.userEmail || 'listener'})`);
+
+            if (conn) {
+                handleBackgroundProcessing(socketId, conn);
+            }
 
             // Clean up associated resources
             const recognizeStream = streamingSessions.get(socketId);

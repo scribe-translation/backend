@@ -79,45 +79,6 @@ class AiService {
       throw error;
     }
   }
-
-  async generateFacebookPost(text) {
-    if (!this.isInitialized || !text || text.trim().length === 0) {
-      return null;
-    }
-
-    try {
-      const prompt = `You are a social media manager for an organization. Write exactly ONE engaging, comprehensive, and inspiring Facebook post based on the following session transcription.
-
-      First, identify the type of content (e.g., sermon, Bible study, lecture, meeting, workshop, speech) and tailor the post to match its context and tone.
-
-      The post structure should include:
-      - An attention-grabbing hook or inspiring thought at the very beginning. ✨
-      - A section called "Key Takeaways" or similar, using bullet points (e.g., • or -) to make the message easy to read on mobile. 📱
-      - If the content is religious in nature, include or reference key Scripture mentioned in the transcription. 📖
-      - Generous use of relevant emojis throughout to break up text and add personality.
-      - A strong Call to Action (CTA) at the end: Ask a thoughtful question, encourage people to share the post, or invite them to reflect. 💬
-
-      CRITICAL INSTRUCTIONS:
-      - ALWAYS provide exactly ONE post option. Do NOT provide alternatives.
-      - DO NOT include any instructions, placeholders (like "[Link here]"), meta-commentary, notes, or tips.
-      - DO NOT explain your choices. Output ONLY the raw text for the Facebook post itself, ready to be copied and pasted.
-      - Ensure the tone is warm, inviting, and grounded in the provided transcription.
-
-      Transcription:\n${text}`;
-
-      const result = await this.model.generateContent(prompt);
-      const response = await result.response;
-
-      if (response.text && typeof response.text === 'function') {
-        return response.text();
-      }
-      return response.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    } catch (error) {
-      console.error('❌ AI Facebook Post generation failed:', error.message);
-      throw error;
-    }
-  }
 }
 
 module.exports = new AiService();
