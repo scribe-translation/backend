@@ -215,7 +215,7 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
     // must not prevent history saves, and must not mark the phrase as processed first.
     // Join bubbles with newlines so history/PDF stay readable as one phrase per line.
     const currentText = sessionTranscripts.get(socket.id) || '';
-    sessionTranscripts.set(socket.id, currentText + (currentText ? '\n' : '') + trimmed);
+    sessionTranscripts.set(socket.id, currentText + (currentText ? '\n- ' : '') + trimmed);
     recordProcessedFinal(socket.id, bubbleId, trimmed);
 
     const currentConnection = activeConnections.get(socket.id);
