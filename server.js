@@ -19,6 +19,7 @@ const googleTranslationService = require('./src/services/googleTranslationServic
 const textToSpeechService = require('./src/services/textToSpeechService')
 const aiService = require('./src/services/aiService')
 const { isSameLanguage } = require('./src/utils/languageCodeMapper')
+const { shouldTranslateInterim } = require('./src/services/interimTranslationThrottle')
 const app = express()
 const server = http.createServer(app)
 
@@ -90,7 +91,6 @@ const __dbg = (location, message, data) => { try { fetch('http://127.0.0.1:7809/
 // #endregion
 
 const interimTranslationThrottle = new Map()
-const INTERIM_THROTTLE_MS = 1000
 
 // ============================================================================
 // CONTENT HASH DEDUPLICATION - Prevents duplicates from overlapping streams
@@ -1631,7 +1631,9 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
     if (listenersByLanguage.size === 0) return;
 
     const translationConnections = getTranslationConnectionIds(currentConnection.sessionCode);
-    const interimTranslationEnabled = await AppSettings.isInterimTranslationEnabled();
+    const interimTranslationEnabled = await AppSettings.isInterimTranslationEnabled(
+        currentConnection.userId
+    );
 
     if (!interimTranslationEnabled) {
         // Cost gate: signal typing without translating interim text
@@ -1661,7 +1663,7 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
                 const throttleEntry = speakerThrottle.get(targetLanguage);
                 const now = Date.now();
 
-                if (throttleEntry && (now - throttleEntry.timestamp) < INTERIM_THROTTLE_MS) {
+                if (throttleEntry && !shouldTranslateInterim(throttleEntry.timestamp, now)) {
                     translatedText = throttleEntry.translatedText;
                     textToSend = translatedText || interimText;
                 } else {
