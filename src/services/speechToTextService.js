@@ -1,7 +1,13 @@
 const fs = require('fs');
-const speech = require('@google-cloud/speech');
+const { v2: speechV2 } = require('@google-cloud/speech');
 const config = require('../config');
 const { spawn } = require('child_process');
+const {
+  selectStreamingModel,
+  buildStreamingConfigRequest,
+  buildAudioRequest,
+  parseStreamingResponse,
+} = require('./streamingRecognitionConfig');
 // No normalization needed - frontend sends proper locale codes (en-US, fr-FR, etc.)
 
 class SpeechToTextService {
@@ -66,7 +72,7 @@ class SpeechToTextService {
     const credentials = await this.initializeCredentials();
     
     if (credentials) {
-      this.client = new speech.SpeechClient({
+      this.client = new speechV2.SpeechClient({
         projectId: this.projectId,
         credentials: {
           client_email: credentials.client_email,
@@ -74,7 +80,7 @@ class SpeechToTextService {
         }
       });
     } else {
-      this.client = new speech.SpeechClient({
+      this.client = new speechV2.SpeechClient({
         projectId: this.projectId
       });
     }
@@ -82,7 +88,6 @@ class SpeechToTextService {
     return this.client;
   }
 
-  /**
   /**
    * Convert WebM audio to LINEAR16 format using FFmpeg
    */
@@ -138,14 +143,17 @@ class SpeechToTextService {
     const client = await this.getSpeechClient();
     
     const request = {
+      recognizer: `projects/${this.projectId}/locations/global/recognizers/_`,
       config: {
-        encoding: 'LINEAR16',
-        sampleRateHertz: 16000,
-        languageCode: 'en-CA',
+        explicitDecodingConfig: {
+          encoding: 'LINEAR16',
+          sampleRateHertz: 16000,
+          audioChannelCount: 1,
+        },
+        languageCodes: ['en-CA'],
+        model: 'telephony',
       },
-      audio: {
-        content: audioBuffer.toString('base64'),
-      },
+      content: audioBuffer,
     };
 
     try {
@@ -158,94 +166,12 @@ class SpeechToTextService {
   }
 
   /**
-   * Get the best model for a given language code
-   * V1 API models: default, latest_long, latest_short, telephony, telephony_short
-   * latest_long is Google's newest Conformer-based model with best quality
-   */
-  getBestModelForLanguage(languageCode) {
-    // Languages that support latest_long (highest quality, Conformer-based)
-    const latestLongSupported = new Set([
-      // English
-      'en-US', 'en-GB', 'en-AU', 'en-IN',
-      // French
-      'fr-FR', 'fr-CA',
-      // Spanish
-      'es-ES', 'es-US',
-      // German
-      'de-DE',
-      // Portuguese
-      'pt-BR', 'pt-PT',
-      // Italian
-      'it-IT',
-      // Japanese
-      'ja-JP',
-      // Korean
-      'ko-KR',
-      // Russian
-      'ru-RU',
-      // Arabic variants
-      'ar-DZ', 'ar-BH', 'ar-EG', 'ar-IQ', 'ar-IL', 'ar-JO', 'ar-KW', 'ar-LB',
-      'ar-MR', 'ar-MA', 'ar-OM', 'ar-QA', 'ar-SA', 'ar-PS', 'ar-TN', 'ar-AE', 'ar-YE',
-      // Asian languages
-      'hi-IN', 'vi-VN', 'th-TH', 'id-ID',
-      // European languages
-      'nl-NL', 'sv-SE', 'da-DK', 'fi-FI', 'no-NO', 'pl-PL', 'cs-CZ', 'tr-TR', 'uk-UA',
-      // Indian languages
-      'bn-BD', 'ta-IN', 'te-IN', 'kn-IN', 'ml-IN', 'mr-IN',
-      // Other
-      'ro-RO', 'bg-BG', 'hu-HU', 'km-KH'
-    ]);
-    
-    // Languages with telephony support (good for conversational, fallback)
-    const telephonySupported = new Set([
-      'en-US', 'en-GB', 'en-AU', 'en-CA', 'en-IN', 'en-IE', 'en-NZ', 'en-SG',
-      'en-HK', 'en-PK',
-      'fr-FR', 'fr-CA', 'fr-BE', 'fr-CH',
-      'es-ES', 'es-US', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE',
-      'de-DE', 'de-AT', 'de-CH',
-      'pt-BR', 'pt-PT',
-      'it-IT', 'it-CH',
-      'ja-JP',
-      'ko-KR',
-      'nl-NL', 'nl-BE',
-      'hi-IN'
-    ]);
-    
-    // Check for latest_long support (preferred - highest quality)
-    if (latestLongSupported.has(languageCode)) {
-      return { model: 'latest_long', useEnhanced: false };
-    }
-    
-    // Check for telephony support (good quality, conversational)
-    if (telephonySupported.has(languageCode)) {
-      return { model: 'telephony', useEnhanced: false };
-    }
-    
-    // Fallback by language prefix to latest_long or telephony
-    const langPrefix = languageCode.split('-')[0];
-    
-    // Check if any variant of this language supports latest_long
-    for (const lang of latestLongSupported) {
-      if (lang.startsWith(langPrefix + '-')) {
-        return { model: 'latest_long', useEnhanced: false };
-      }
-    }
-    
-    // Check if any variant supports telephony
-    for (const lang of telephonySupported) {
-      if (lang.startsWith(langPrefix + '-')) {
-        return { model: 'telephony', useEnhanced: false };
-      }
-    }
-    
-    // Ultimate fallback to default (supports all languages)
-    return { model: 'default', useEnhanced: false };
-  }
-
-  /**
-   * Start streaming recognition with Google Cloud Speech-to-Text V1 API
+   * Start streaming recognition with Google Cloud Speech-to-Text V2 API.
+   * speechEndTimeout is retained so existing callers keep the same signature.
+   * Phrase length is controlled by v2 endpointing sensitivity.
    */
   async startStreamingRecognition(languageCode, speechEndTimeout = 1.0, callbacks) {
+    void speechEndTimeout;
     const client = await this.getSpeechClient();
     
     // Verify project ID is set
@@ -253,31 +179,18 @@ class SpeechToTextService {
       throw new Error('GOOGLE_CLOUD_PROJECT_ID is not set');
     }
     
-    // Determine best model based on language
-    const modelInfo = this.getBestModelForLanguage(languageCode);
-    const model = modelInfo.model;
-    const useEnhanced = modelInfo.useEnhanced;
+    const model = selectStreamingModel(languageCode);
+    const configRequest = buildStreamingConfigRequest({
+      projectId: this.projectId,
+      languageCode,
+      sampleRateHertz: 48000,
+    });
     
-    console.log(`🔍 [V1 API] Selected model for ${languageCode}: ${model} (enhanced: ${useEnhanced})`);
+    console.log(`🔍 [V2 API] Selected model for ${languageCode}: ${model} (interim results)`);
     
-    // V1 API streaming configuration
-    const streamingConfig = {
-      config: {
-        encoding: 'LINEAR16',
-        sampleRateHertz: 48000,
-        languageCode: languageCode,
-        model: model,
-        useEnhanced: useEnhanced,
-        enableAutomaticPunctuation: true,
-        enableWordTimeOffsets: true
-      },
-      interimResults: true
-    };
+    const recognizeStream = client._streamingRecognize();
     
-    // Create the streaming recognition request
-    const recognizeStream = client.streamingRecognize(streamingConfig);
-    
-    console.log(`✅ [V1 API] Stream created with model "${model}" for ${languageCode}`);
+    console.log(`✅ [V2 API] Stream created with model "${model}" for ${languageCode}`);
 
     // Stream health tracking
     const streamHealth = {
@@ -333,29 +246,15 @@ class SpeechToTextService {
     recognizeStream._forceFinalizeTimer = forceFinalizeTimer;
     recognizeStream._healthCheckInterval = healthCheckInterval;
 
-    // Handle streaming responses - Works with both V1 and V2 models
     recognizeStream.on('data', (response) => {
-      // Update health tracking - we received data
       if (recognizeStream._health) {
         recognizeStream._health.lastDataTime = Date.now();
       }
-      
-      if (response.results && response.results.length > 0) {
-        const result = response.results[0];
-        if (result.alternatives && result.alternatives.length > 0) {
-          const alternative = result.alternatives[0];
-          const transcript = alternative.transcript;
-          const isFinal = result.isFinal || false;
-          const confidence = alternative.confidence || 0.8;
-          
-          if (callbacks && callbacks.onResult) {
-            callbacks.onResult({
-              transcript: transcript,
-              isFinal: isFinal,
-              confidence: confidence,
-              resultEndTime: result.resultEndTime
-            });
-          }
+
+      const parsedResults = parseStreamingResponse(response);
+      if (callbacks && callbacks.onResult) {
+        for (const parsed of parsedResults) {
+          callbacks.onResult(parsed);
         }
       }
     });
@@ -406,6 +305,7 @@ class SpeechToTextService {
 
     recognizeStream.on('end', () => {
       console.log(`📊 [STREAM] Stream ended after ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      recognizeStream.destroyed = true;
       clearTimeout(rotationArmTimer);
       clearTimeout(forceFinalizeTimer);
       clearInterval(healthCheckInterval);
@@ -414,12 +314,13 @@ class SpeechToTextService {
       }
     });
 
+    recognizeStream.write(configRequest);
+
     return recognizeStream;
   }
 
   /**
-   * Send audio data to streaming recognition
-   * Audio is sent directly as buffer to the streaming recognition
+   * Send audio data to streaming recognition.
    */
   sendAudioToStream(recognizeStream, audioBuffer) {
     if (recognizeStream && !recognizeStream.destroyed) {
@@ -428,7 +329,7 @@ class SpeechToTextService {
         if (recognizeStream._health) {
           recognizeStream._health.lastAudioTime = Date.now();
         }
-        recognizeStream.write(audioBuffer);
+        recognizeStream.write(buildAudioRequest(audioBuffer));
       } catch (error) {
         console.error('❌ Error writing to stream:', error);
       }
