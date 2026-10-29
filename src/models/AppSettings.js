@@ -1,12 +1,40 @@
 const { getDb, Collections, dateToTimestamp } = require('../database/firestore');
+const {
+  interimTranslationFlagFromDoc,
+  mergeFlagTargeting,
+  resolveFlagForUser,
+} = require('./flagTargeting');
 
 const DOC_ID = 'app';
 const CACHE_TTL_MS = 30 * 1000;
 
 let cache = {
-  interimTranslationEnabled: false,
+  flag: null,
   expiresAt: 0,
 };
+
+function invalidateCache() {
+  cache = { flag: null, expiresAt: 0 };
+}
+
+function settingsFromDoc(data) {
+  const flag = interimTranslationFlagFromDoc(data);
+  return {
+    interimTranslationEnabled: flag.defaultValue,
+    interimTranslationEnabledUserIds: flag.enabledUserIds,
+    interimTranslationDisabledUserIds: flag.disabledUserIds,
+    updatedAt: data?.updatedAt?.toDate?.() ?? null,
+  };
+}
+
+function targetingError(result) {
+  const error = new Error(
+    result.error || 'A user cannot be both on and off for the same flag'
+  );
+  error.code = result.conflictUserIds ? 'FLAG_TARGETING_CONFLICT' : 'INVALID_FLAG_TARGETING';
+  error.conflictUserIds = result.conflictUserIds;
+  return error;
+}
 
 class AppSettings {
   static DOC_ID = DOC_ID;
@@ -43,10 +71,7 @@ class AppSettings {
       const db = getDb();
       const snapshot = await db.collection(Collections.SETTINGS).doc(DOC_ID).get();
       const data = snapshot.exists ? snapshot.data() : {};
-      return {
-        interimTranslationEnabled: data?.interimTranslationEnabled === true,
-        updatedAt: data?.updatedAt?.toDate?.() ?? null,
-      };
+      return settingsFromDoc(data);
     } catch (error) {
       console.error('Error reading app settings:', error.message);
       throw error;
@@ -55,19 +80,34 @@ class AppSettings {
 
   static async update(partial) {
     try {
-      const db = getDb();
-      const docRef = db.collection(Collections.SETTINGS).doc(DOC_ID);
-      const updates = {
-        updatedAt: dateToTimestamp(new Date()),
-      };
+      const current = await AppSettings.getAll();
+      const merged = mergeFlagTargeting(
+        {
+          defaultValue: current.interimTranslationEnabled,
+          enabledUserIds: current.interimTranslationEnabledUserIds,
+          disabledUserIds: current.interimTranslationDisabledUserIds,
+        },
+        {
+          defaultValue: partial.interimTranslationEnabled,
+          enabledUserIds: partial.interimTranslationEnabledUserIds,
+          disabledUserIds: partial.interimTranslationDisabledUserIds,
+        }
+      );
 
-      if (partial.interimTranslationEnabled !== undefined) {
-        updates.interimTranslationEnabled = partial.interimTranslationEnabled === true;
+      if (!merged.ok) {
+        throw targetingError(merged);
       }
 
-      await docRef.set(updates, { merge: true });
+      const db = getDb();
+      const docRef = db.collection(Collections.SETTINGS).doc(DOC_ID);
+      await docRef.set({
+        interimTranslationEnabled: merged.targeting.defaultValue,
+        interimTranslationEnabledUserIds: merged.targeting.enabledUserIds,
+        interimTranslationDisabledUserIds: merged.targeting.disabledUserIds,
+        updatedAt: dateToTimestamp(new Date()),
+      }, { merge: true });
 
-      cache = { interimTranslationEnabled: false, expiresAt: 0 };
+      invalidateCache();
 
       return AppSettings.getAll();
     } catch (error) {
@@ -77,34 +117,37 @@ class AppSettings {
   }
 
   /**
-   * Read interimTranslationEnabled with a short in-memory cache.
-   * Fail closed (false) on read errors so interim translation stays off under cost pressure.
+   * Read the interim-translation flag with a short in-memory cache, then
+   * resolve it for one speaker. Fail closed on read errors.
    */
-  static async isInterimTranslationEnabled() {
+  static async isInterimTranslationEnabled(userId) {
+    const flag = await AppSettings.readInterimTranslationFlag();
+    return resolveFlagForUser(flag, userId);
+  }
+
+  static async readInterimTranslationFlag() {
     const now = Date.now();
-    if (now < cache.expiresAt) {
-      return cache.interimTranslationEnabled;
+    if (cache.flag && now < cache.expiresAt) {
+      return cache.flag;
     }
 
     try {
       const db = getDb();
       const snapshot = await db.collection(Collections.SETTINGS).doc(DOC_ID).get();
-      const enabled = snapshot.exists
-        ? snapshot.data()?.interimTranslationEnabled === true
-        : false;
-
+      const flag = interimTranslationFlagFromDoc(snapshot.exists ? snapshot.data() : {});
       cache = {
-        interimTranslationEnabled: enabled,
+        flag,
         expiresAt: now + CACHE_TTL_MS,
       };
-      return enabled;
+      return flag;
     } catch (error) {
       console.error('❌ Error reading interimTranslationEnabled (defaulting to false):', error.message);
+      const flag = interimTranslationFlagFromDoc({});
       cache = {
-        interimTranslationEnabled: false,
+        flag,
         expiresAt: now + CACHE_TTL_MS,
       };
-      return false;
+      return flag;
     }
   }
 }

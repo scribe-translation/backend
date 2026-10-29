@@ -11,7 +11,7 @@
     "emulator": "firebase emulators:start --only firestore --project demo-scribe --import=./emulator-data --export-on-exit=./emulator-data",
     "migrate:session-code": "node src/migrations/rename-userCode-to-sessionCode.js",
     "migrate:session-code:dry-run": "node src/migrations/rename-userCode-to-sessionCode.js --dry-run",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test src/models/flagTargeting.test.js src/services/interimTranslationThrottle.test.js src/services/streamingRecognitionConfig.test.js",
     "kill": "bash shutdown.sh",
     "cleanup": "pkill -f 'firebase.*emulators' || true"
   },

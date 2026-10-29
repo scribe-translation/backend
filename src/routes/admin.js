@@ -169,17 +169,37 @@ router.get('/settings', async (req, res) => {
  */
 router.patch('/settings', async (req, res) => {
   try {
-    const { interimTranslationEnabled } = req.body;
-    if (interimTranslationEnabled === undefined) {
+    const {
+      interimTranslationEnabled,
+      interimTranslationEnabledUserIds,
+      interimTranslationDisabledUserIds,
+    } = req.body;
+
+    if (
+      interimTranslationEnabled === undefined &&
+      interimTranslationEnabledUserIds === undefined &&
+      interimTranslationDisabledUserIds === undefined
+    ) {
       return res.status(400).json({
         error: 'No settings provided',
         code: 'MISSING_SETTINGS',
       });
     }
 
-    const settings = await AppSettings.update({ interimTranslationEnabled });
+    const settings = await AppSettings.update({
+      interimTranslationEnabled,
+      interimTranslationEnabledUserIds,
+      interimTranslationDisabledUserIds,
+    });
     res.json({ message: 'Settings updated', settings });
   } catch (error) {
+    if (error.code === 'FLAG_TARGETING_CONFLICT' || error.code === 'INVALID_FLAG_TARGETING') {
+      return res.status(400).json({
+        error: error.message,
+        code: error.code,
+        conflictUserIds: error.conflictUserIds,
+      });
+    }
     console.error('Admin patch settings error:', error.message);
     res.status(500).json({ error: 'Failed to update settings', message: error.message });
   }
