@@ -685,6 +685,11 @@ async function rotateStream(socket, options = {}) {
     const { emergency = false } = options
     const socketId = socket.id
 
+    // Google-only timed rotation; Deepgram still uses emergency restart
+    if (!emergency && !speechToTextService.supportsStreamRotation()) {
+        return
+    }
+
     if (!emergency && !speechToTextService.isRotationArmed(socketId)) {
         return
     }
@@ -825,7 +830,7 @@ function createStreamCallbacks(socket) {
             }
         },
         onError: (error) => {
-            console.error('❌ Google Cloud streaming error:', error)
+            console.error('❌ STT streaming error:', error)
             if (error.code === 14 || (error.message && error.message.includes('UNAVAILABLE'))) {
                 setTimeout(async () => {
                     if (socket.connected) {
@@ -838,15 +843,21 @@ function createStreamCallbacks(socket) {
                 }, 1000)
             }
         },
-        onEnd: () => {
-            streamingSessions.delete(socket.id)
+        onEnd: (endedStream) => {
+            // Only clear if this socket still points at the ended stream (avoids
+            // wiping a replacement stream installed during rotate/restart).
+            if (!endedStream || streamingSessions.get(socket.id) === endedStream) {
+                streamingSessions.delete(socket.id)
+            }
         },
         onRotationArm: () => {
+            if (!speechToTextService.supportsStreamRotation()) return
             if (speechToTextService.isRotationArmed(socket.id)) return
             speechToTextService.armRotation(socket.id)
             console.log(`⏰ [ROTATE] Rotation armed for ${socket.id} at 3:00`)
         },
         onForceFinalize: () => {
+            if (!speechToTextService.supportsStreamRotation()) return
             if (!socket.connected) return
 
             clearForceFinalizeSafetyTimer(socket.id)
@@ -1816,6 +1827,14 @@ app.get('/api/tts/supported', (req, res) => {
     res.json({ languageCode, supported })
 })
 
+// Active streaming STT provider (drives speaker source-language catalog)
+app.get('/api/stt/config', (req, res) => {
+    res.json({
+        provider: speechToTextService.getProviderName(),
+        supportsStreamRotation: speechToTextService.supportsStreamRotation(),
+    })
+})
+
 app.get('/api/sessions', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
@@ -1887,11 +1906,11 @@ const startServer = async () => {
         }
 
         try {
-            await speechToTextService.getSpeechClient()
-            console.log('✅ Google Cloud Speech client initialized')
+            await speechToTextService.warmClient()
+            console.log(`✅ STT client initialized (${speechToTextService.getProviderName()})`)
         } catch (error) {
-            console.warn('⚠️ Google Cloud Speech client initialization failed:', error.message)
-            console.log('⚠️ Continuing without Google Cloud Speech (transcription will not work)')
+            console.warn(`⚠️ STT client initialization failed (${speechToTextService.getProviderName()}):`, error.message)
+            console.log('⚠️ Continuing without streaming STT (transcription will not work)')
         }
 
         setInterval(() => {
