@@ -27,6 +27,10 @@ module.exports = {
   
   // Google Cloud
   GOOGLE_CLOUD_PROJECT_ID: process.env.GOOGLE_CLOUD_PROJECT_ID || 'scribe-471123',
+
+  // Streaming STT: deepgram (default) or google
+  STT_PROVIDER: process.env.STT_PROVIDER || 'deepgram',
+  DEEPGRAM_API_KEY: process.env.DEEPGRAM_API_KEY || '',
   
   // Logging
   LOG_LEVEL: 'warn'

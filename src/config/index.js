@@ -33,6 +33,8 @@ const finalConfig = {
   JWT_REFRESH_EXPIRES_IN: process.env.JWT_REFRESH_EXPIRES_IN || config.JWT_REFRESH_EXPIRES_IN,
   GOOGLE_CLOUD_PROJECT_ID: process.env.GOOGLE_CLOUD_PROJECT_ID || config.GOOGLE_CLOUD_PROJECT_ID,
   GOOGLE_CLOUD_API_KEY: process.env.GOOGLE_CLOUD_API_KEY || config.GOOGLE_CLOUD_API_KEY,
+  STT_PROVIDER: (process.env.STT_PROVIDER || config.STT_PROVIDER || 'deepgram').toLowerCase(),
+  DEEPGRAM_API_KEY: process.env.DEEPGRAM_API_KEY || config.DEEPGRAM_API_KEY || '',
   CORS_ORIGIN: process.env.CORS_ORIGIN || config.CORS_ORIGIN,
   FRONTEND_URL: process.env.FRONTEND_URL || config.FRONTEND_URL,
   TRANSLATION_URL: process.env.TRANSLATION_URL || config.TRANSLATION_URL,
@@ -44,8 +46,16 @@ const finalConfig = {
     .filter(Boolean),
 };
 
+if (!['deepgram', 'google'].includes(finalConfig.STT_PROVIDER)) {
+  console.error(`Invalid STT_PROVIDER "${finalConfig.STT_PROVIDER}". Use "deepgram" or "google".`);
+  process.exit(1);
+}
+
 if (environment === 'prod') {
   const requiredVars = ['JWT_SECRET', 'CORS_ORIGIN', 'GOOGLE_CLOUD_PROJECT_ID'];
+  if (finalConfig.STT_PROVIDER === 'deepgram') {
+    requiredVars.push('DEEPGRAM_API_KEY');
+  }
   const missingVars = requiredVars.filter(varName => !finalConfig[varName]);
 
   if (missingVars.length > 0) {

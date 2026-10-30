@@ -11,7 +11,7 @@
     "emulator": "firebase emulators:start --only firestore --project demo-scribe --import=./emulator-data --export-on-exit=./emulator-data",
     "migrate:session-code": "node src/migrations/rename-userCode-to-sessionCode.js",
     "migrate:session-code:dry-run": "node src/migrations/rename-userCode-to-sessionCode.js --dry-run",
-    "test": "node --test src/models/flagTargeting.test.js src/services/interimTranslationThrottle.test.js src/services/streamingRecognitionConfig.test.js",
+    "test": "node --test src/models/flagTargeting.test.js src/services/interimTranslationThrottle.test.js src/services/streamingRecognitionConfig.test.js src/services/stt/deepgramResults.test.js src/services/stt/deepgramLanguage.test.js src/services/stt/createProvider.test.js",
     "kill": "bash shutdown.sh",
     "cleanup": "pkill -f 'firebase.*emulators' || true"
   },
@@ -25,6 +25,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@deepgram/sdk": "^5.17.0",
     "@google-cloud/firestore": "^8.0.0",
     "@google-cloud/secret-manager": "^6.1.0",
     "@google-cloud/speech": "^7.5.0",
