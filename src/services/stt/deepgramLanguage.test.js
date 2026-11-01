@@ -5,13 +5,13 @@ const { mapLanguageCodeForDeepgram } = require('./deepgramLanguage');
 describe('mapLanguageCodeForDeepgram', () => {
   it('passes through known Deepgram locales', () => {
     assert.equal(mapLanguageCodeForDeepgram('en-US'), 'en-US');
-    assert.equal(mapLanguageCodeForDeepgram('en-CA'), 'en-CA');
     assert.equal(mapLanguageCodeForDeepgram('fr-CA'), 'fr-CA');
     assert.equal(mapLanguageCodeForDeepgram('ja'), 'ja');
     assert.equal(mapLanguageCodeForDeepgram('kk'), 'kk');
   });
 
-  it('aliases unsupported Google-style locales onto Deepgram codes', () => {
+  it('aliases unsupported locales onto Deepgram codes (en-CA is rejected by nova-3)', () => {
+    assert.equal(mapLanguageCodeForDeepgram('en-CA'), 'en');
     assert.equal(mapLanguageCodeForDeepgram('en-IE'), 'en');
     assert.equal(mapLanguageCodeForDeepgram('es-MX'), 'es-419');
     assert.equal(mapLanguageCodeForDeepgram('ja-JP'), 'ja');
