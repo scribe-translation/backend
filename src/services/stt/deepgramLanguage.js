@@ -1,3 +1,10 @@
+/**
+ * Deepgram Nova-3 *monolingual* language codes accepted by Live streaming.
+ * Reference: https://developers.deepgram.com/docs/models-languages-overview
+ *
+ * Important: multilingual-only codes (e.g. en-CA, xh, zu) must NOT be sent as
+ * `language=` on a normal nova-3 live connection — Deepgram returns HTTP 400.
+ */
 const DEEPGRAM_LANGUAGE_CODES = new Set([
   'multi',
   'af', 'af-ZA',
@@ -15,7 +22,7 @@ const DEEPGRAM_LANGUAGE_CODES = new Set([
   'cs', 'cs-CZ',
   'da', 'da-DK',
   'nl', 'nl-BE',
-  'en', 'en-US', 'en-AU', 'en-GB', 'en-IN', 'en-NZ', 'en-CA',
+  'en', 'en-US', 'en-AU', 'en-GB', 'en-IN', 'en-NZ',
   'et',
   'fi',
   'fr', 'fr-CA',
@@ -60,11 +67,15 @@ const DEEPGRAM_LANGUAGE_CODES = new Set([
   'uk',
   'ur',
   'vi',
-  'xh',
-  'zu',
 ]);
 
+/**
+ * UI / cookie / Google leftovers that Deepgram monolingual nova-3 rejects.
+ * Map onto an accepted code before opening the live socket.
+ */
 const LOCALE_ALIASES = {
+  // Confirmed: language=en-CA → Unexpected server response: 400
+  'en-CA': 'en',
   'en-IE': 'en',
   'en-SG': 'en',
   'en-HK': 'en',
@@ -88,6 +99,8 @@ const LOCALE_ALIASES = {
   'ru-RU': 'ru',
   'uk-UA': 'uk',
   'yue-Hant-HK': 'zh-HK',
+  'xh': 'en',
+  'zu': 'en',
 };
 
 function mapLanguageCodeForDeepgram(languageCode) {
@@ -100,12 +113,13 @@ function mapLanguageCodeForDeepgram(languageCode) {
     return 'en';
   }
 
-  if (DEEPGRAM_LANGUAGE_CODES.has(normalized)) {
-    return normalized;
-  }
-
+  // Aliases first so known-bad codes never pass through the allow-set
   if (LOCALE_ALIASES[normalized]) {
     return LOCALE_ALIASES[normalized];
+  }
+
+  if (DEEPGRAM_LANGUAGE_CODES.has(normalized)) {
+    return normalized;
   }
 
   const family = normalized.split('-')[0];

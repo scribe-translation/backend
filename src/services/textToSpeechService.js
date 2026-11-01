@@ -123,6 +123,7 @@ class TextToSpeechService {
       
       // Filipino
       'fil': 'fil-PH',
+      'tl': 'fil-PH',
       
       // Finnish
       'fi': 'fi-FI',

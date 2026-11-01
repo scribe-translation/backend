@@ -33,7 +33,15 @@ function getBaseLanguageCode(languageCode) {
   
   // Extract base code (en-US -> en, fr-FR -> fr)
   const parts = languageCode.split('-');
-  return parts[0];
+  const base = parts[0];
+
+  // `fil` is formal written Filipino. Tagalog `tl` is the contemporary code
+  // Google Translate uses for this language. Match the whole code so Finnish `fi` stays Finnish.
+  if (base === 'fil') {
+    return 'tl';
+  }
+
+  return base;
 }
 
 /**
