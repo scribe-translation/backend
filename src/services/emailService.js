@@ -293,6 +293,59 @@ class EmailService {
     }
   }
 
+  async sendDiscountApplicationNotification({
+    to,
+    applicantName,
+    applicantEmail,
+    organizationType,
+    organizationName,
+    city,
+  }) {
+    const adminUrl = (process.env.FRONTEND_URL || 'https://speaker.scribe-ai.ca').replace(/\/$/, '') + '/admin';
+    const msg = {
+      to,
+      from:
+        process.env.APPLICATIONS_FROM_EMAIL ||
+        'Scribe Applications <applications@scribe-ai.ca>',
+      subject: `Discount application: ${organizationName}`,
+      html: `
+        <p>A new ${organizationType} discount application was submitted.</p>
+        <ul>
+          <li><strong>Organization:</strong> ${organizationName}</li>
+          <li><strong>City:</strong> ${city}</li>
+          <li><strong>Applicant:</strong> ${applicantName} (${applicantEmail})</li>
+        </ul>
+        <p><a href="${adminUrl}">Review in Admin</a></p>
+      `,
+      text: `Discount application from ${applicantName} (${applicantEmail}) for ${organizationType} "${organizationName}" in ${city}. Review: ${adminUrl}`,
+    };
+
+    if (this.resend) {
+      const { data, error } = await this.resend.emails.send({
+        from: msg.from,
+        to: msg.to,
+        subject: msg.subject,
+        html: msg.html,
+        text: msg.text,
+      });
+      if (error) throw error;
+      return data;
+    }
+
+    if (process.env.SENDGRID_API_KEY) {
+      const info = await sgMail.send(msg);
+      return info[0];
+    }
+
+    if (this.transporter) {
+      return this.transporter.sendMail(msg);
+    }
+
+    console.log('📧 DISCOUNT APPLICATION (No credentials - Development Mode):');
+    console.log(msg.text);
+    return { messageId: 'dev-' + Date.now() };
+  }
+
   /**
    * Test email configuration
    * @returns {Promise<boolean>}

@@ -8,7 +8,13 @@ function registerActiveConnections(map) {
 
 function getLiveConnectionsSnapshot() {
   if (!activeConnectionsRef) {
-    return { connections: [], groups: [], totalConnections: 0, streamingCount: 0 };
+    return {
+      connections: [],
+      groups: [],
+      totalConnections: 0,
+      totalListeners: 0,
+      streamingCount: 0,
+    };
   }
 
   const now = Date.now();
@@ -57,9 +63,6 @@ function getLiveConnectionsSnapshot() {
       group.listenerCount += 1;
       group.languages.add(conn.targetLanguage);
     }
-    if (conn.sourceLanguage) {
-      group.languages.add(conn.sourceLanguage);
-    }
   }
 
   const groups = Array.from(groupsMap.values()).map((g) => ({
@@ -71,10 +74,13 @@ function getLiveConnectionsSnapshot() {
     languages: Array.from(g.languages),
   }));
 
+  const totalListeners = groups.reduce((sum, g) => sum + g.listenerCount, 0);
+
   return {
     connections,
     groups,
     totalConnections: connections.length,
+    totalListeners,
     streamingCount: connections.filter((c) => c.isStreaming).length,
   };
 }

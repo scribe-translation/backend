@@ -1,6 +1,14 @@
 const bcrypt = require('bcrypt');
 const { getDb, Collections, timestampToDate, dateToTimestamp } = require('../database/firestore');
 const { FieldValue } = require('@google-cloud/firestore');
+const {
+  SIGNUP_GRANT_SECONDS,
+  BILLING_TIERS,
+  CURRENCIES,
+  LEDGER_TYPES,
+  normalizeCurrency,
+  isValidBillingTier,
+} = require('../billing/constants');
 
 class User {
   /** Canonical Firestore field for listener join codes. */
@@ -23,6 +31,11 @@ class User {
     this.totalUsageMinutes = data.totalUsageMinutes || 0;
     this.totalSessions = data.totalSessions || 0;
     this.lastActiveAt = timestampToDate(data.lastActiveAt);
+    this.balanceSeconds = typeof data.balanceSeconds === 'number' ? data.balanceSeconds : 0;
+    this.billingTier = isValidBillingTier(data.billingTier)
+      ? data.billingTier
+      : BILLING_TIERS.STANDARD;
+    this.preferredCurrency = normalizeCurrency(data.preferredCurrency || CURRENCIES.CAD);
   }
 
   static resolveSessionCodeFromData(data) {
@@ -104,6 +117,7 @@ class User {
     try {
       const db = getDb();
       const usersRef = db.collection(Collections.USERS);
+      const CreditLedger = require('./CreditLedger');
       
       const hashedPassword = password.includes(':') ? password : await bcrypt.hash(password, 12);
       
@@ -122,13 +136,24 @@ class User {
         totalUsageMinutes: 0,
         totalSessions: 0,
         lastActiveAt: null,
+        balanceSeconds: 0,
+        billingTier: BILLING_TIERS.STANDARD,
+        preferredCurrency: CURRENCIES.CAD,
       };
 
       const docRef = await usersRef.add(userData);
+
+      await CreditLedger.grantSeconds({
+        userId: docRef.id,
+        seconds: SIGNUP_GRANT_SECONDS,
+        type: LEDGER_TYPES.SIGNUP_GRANT,
+        note: 'Signup grant: 2 hours',
+      });
       
       return new User({
         id: docRef.id,
         ...userData,
+        balanceSeconds: SIGNUP_GRANT_SECONDS,
       });
     } catch (error) {
       console.error('Error creating user:', error);
@@ -206,6 +231,11 @@ class User {
           lastActiveAt: timestampToDate(data.lastActiveAt),
           createdAt: timestampToDate(data.createdAt),
           updatedAt: timestampToDate(data.updatedAt),
+          balanceSeconds: typeof data.balanceSeconds === 'number' ? data.balanceSeconds : 0,
+          billingTier: isValidBillingTier(data.billingTier)
+            ? data.billingTier
+            : BILLING_TIERS.STANDARD,
+          preferredCurrency: normalizeCurrency(data.preferredCurrency || CURRENCIES.CAD),
         };
       });
     } catch (error) {
@@ -570,6 +600,81 @@ class User {
     }
   }
 
+  static async setPreferredCurrency(userId, currency) {
+    const normalized = normalizeCurrency(currency);
+    const db = getDb();
+    const docRef = db.collection(Collections.USERS).doc(userId);
+    await docRef.update({
+      preferredCurrency: normalized,
+      updatedAt: dateToTimestamp(new Date()),
+    });
+    return normalized;
+  }
+
+  static async setBillingTier(userId, tier) {
+    if (!isValidBillingTier(tier)) {
+      throw new Error('Invalid billing tier');
+    }
+    const db = getDb();
+    const docRef = db.collection(Collections.USERS).doc(userId);
+    await docRef.update({
+      billingTier: tier,
+      updatedAt: dateToTimestamp(new Date()),
+    });
+    return tier;
+  }
+
+  /**
+   * Ensure older accounts created before billing have a balance field.
+   * Missing field → grant the signup allotment once. Explicit 0 stays 0.
+   */
+  static async ensureBillingDefaults(userId) {
+    const db = getDb();
+    const docRef = db.collection(Collections.USERS).doc(userId);
+    const doc = await docRef.get();
+    if (!doc.exists) return null;
+
+    const data = doc.data();
+    const updates = {};
+    if (data.billingTier === undefined) {
+      updates.billingTier = BILLING_TIERS.STANDARD;
+    }
+    if (data.preferredCurrency === undefined) {
+      updates.preferredCurrency = CURRENCIES.CAD;
+    }
+
+    let grantedSignup = false;
+    if (data.balanceSeconds === undefined) {
+      const CreditLedger = require('./CreditLedger');
+      await CreditLedger.grantSeconds({
+        userId,
+        seconds: SIGNUP_GRANT_SECONDS,
+        type: LEDGER_TYPES.SIGNUP_GRANT,
+        note: 'Backfill signup grant for existing account',
+      });
+      grantedSignup = true;
+    }
+
+    if (Object.keys(updates).length > 0) {
+      updates.updatedAt = dateToTimestamp(new Date());
+      await docRef.update(updates);
+    }
+
+    return User.findUserById(userId).then((user) => ({ user, grantedSignup }));
+  }
+
+  static async getBalance(userId) {
+    await User.ensureBillingDefaults(userId);
+    const user = await User.findUserById(userId);
+    if (!user) return null;
+    return {
+      balanceSeconds: user.balanceSeconds,
+      billingTier: user.billingTier,
+      preferredCurrency: user.preferredCurrency,
+      complimentary: user.billingTier === BILLING_TIERS.COMPLIMENTARY,
+    };
+  }
+
   toJSON() {
     return {
       id: this.id,
@@ -584,6 +689,9 @@ class User {
       totalUsageMinutes: this.totalUsageMinutes,
       totalSessions: this.totalSessions,
       lastActiveAt: this.lastActiveAt,
+      balanceSeconds: this.balanceSeconds,
+      billingTier: this.billingTier,
+      preferredCurrency: this.preferredCurrency,
     };
   }
 }

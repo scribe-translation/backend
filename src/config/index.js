@@ -44,6 +44,15 @@ const finalConfig = {
     .split(',')
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean),
+  STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || '',
+  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || '',
+  STRIPE_DISCOUNT_COUPON_ID: process.env.STRIPE_DISCOUNT_COUPON_ID || '',
+  STRIPE_PRICE_HOURS_5_USD: process.env.STRIPE_PRICE_HOURS_5_USD || '',
+  STRIPE_PRICE_HOURS_5_CAD: process.env.STRIPE_PRICE_HOURS_5_CAD || '',
+  STRIPE_PRICE_HOURS_10_USD: process.env.STRIPE_PRICE_HOURS_10_USD || '',
+  STRIPE_PRICE_HOURS_10_CAD: process.env.STRIPE_PRICE_HOURS_10_CAD || '',
+  STRIPE_PRICE_HOURS_20_USD: process.env.STRIPE_PRICE_HOURS_20_USD || '',
+  STRIPE_PRICE_HOURS_20_CAD: process.env.STRIPE_PRICE_HOURS_20_CAD || '',
 };
 
 if (!['deepgram', 'google'].includes(finalConfig.STT_PROVIDER)) {

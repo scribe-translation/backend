@@ -87,6 +87,8 @@ const Collections = {
   SESSIONS: 'sessions',
   PASSWORD_RESET_TOKENS: 'passwordResetTokens',
   SETTINGS: 'settings',
+  CREDIT_LEDGER: 'creditLedger',
+  DISCOUNT_APPLICATIONS: 'discountApplications',
 };
 
 /**
