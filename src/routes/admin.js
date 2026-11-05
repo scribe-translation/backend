@@ -2,7 +2,9 @@ const express = require('express');
 const User = require('../models/User');
 const Session = require('../models/Session');
 const AppSettings = require('../models/AppSettings');
+const DiscountApplication = require('../models/DiscountApplication');
 const { getLiveConnectionsSnapshot } = require('../services/connectionRegistry');
+const { APPLICATION_STATUSES, BILLING_TIERS, isValidBillingTier } = require('../billing/constants');
 
 const router = express.Router();
 
@@ -46,7 +48,7 @@ router.get('/users', async (req, res) => {
 router.patch('/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { isActive, clearSessionCode, confirm } = req.body;
+    const { isActive, clearSessionCode, confirm, billingTier } = req.body;
 
     if (id === req.user.id && isActive === false) {
       return res.status(400).json({
@@ -76,6 +78,17 @@ router.patch('/users/:id', async (req, res) => {
       await User.reactivateUser(id);
     }
 
+    if (billingTier !== undefined) {
+      if (!isValidBillingTier(billingTier)) {
+        return res.status(400).json({
+          error: 'Invalid billing tier',
+          code: 'INVALID_BILLING_TIER',
+          allowed: Object.values(BILLING_TIERS),
+        });
+      }
+      await User.setBillingTier(id, billingTier);
+    }
+
     const updated = await User.findUserById(id);
     res.json({
       message: 'User updated',
@@ -84,6 +97,58 @@ router.patch('/users/:id', async (req, res) => {
   } catch (error) {
     console.error('Admin patch user error:', error.message);
     res.status(500).json({ error: 'Failed to update user', message: error.message });
+  }
+});
+
+/**
+ * @route GET /admin/applications
+ */
+router.get('/applications', async (req, res) => {
+  try {
+    const status = req.query.status || null;
+    const applications = await DiscountApplication.list({ status });
+    res.json({ applications: applications.map((a) => a.toJSON()) });
+  } catch (error) {
+    console.error('Admin applications error:', error.message);
+    res.status(500).json({ error: 'Failed to load applications', message: error.message });
+  }
+});
+
+/**
+ * @route PATCH /admin/applications/:id
+ * Body: { status: 'complimentary' | 'discount' | 'declined' }
+ */
+router.patch('/applications/:id', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const allowed = [
+      APPLICATION_STATUSES.COMPLIMENTARY,
+      APPLICATION_STATUSES.DISCOUNT,
+      APPLICATION_STATUSES.DECLINED,
+    ];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid status',
+        code: 'INVALID_STATUS',
+        allowed,
+      });
+    }
+
+    const application = await DiscountApplication.review(req.params.id, {
+      status,
+      reviewedBy: req.user.email || req.user.id,
+    });
+
+    res.json({
+      message: 'Application reviewed',
+      application: application.toJSON(),
+    });
+  } catch (error) {
+    if (error.message === 'Application not found') {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    console.error('Admin review application error:', error.message);
+    res.status(500).json({ error: 'Failed to review application', message: error.message });
   }
 });
 

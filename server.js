@@ -9,6 +9,8 @@ const config = require('./src/config')
 const { authenticateSocket, authenticateToken, requireAdmin } = require('./src/middleware/auth')
 const authRoutes = require('./src/routes/auth')
 const adminRoutes = require('./src/routes/admin')
+const billingRoutes = require('./src/routes/billing')
+const { fulfillCheckoutSession } = require('./src/routes/billing')
 const { registerActiveConnections } = require('./src/services/connectionRegistry')
 const User = require('./src/models/User')
 const Session = require('./src/models/Session')
@@ -20,6 +22,8 @@ const textToSpeechService = require('./src/services/textToSpeechService')
 const aiService = require('./src/services/aiService')
 const { isSameLanguage } = require('./src/utils/languageCodeMapper')
 const { shouldTranslateInterim } = require('./src/services/interimTranslationThrottle')
+const { startMetering, reconcileMetering, stopMetering } = require('./src/services/balanceMeter')
+const stripeService = require('./src/services/stripeService')
 const app = express()
 const server = http.createServer(app)
 
@@ -65,11 +69,39 @@ const io = socketIo(server, {
 
 io.use(authenticateSocket)
 
+// Stripe webhooks need the raw body for signature verification
+app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const signature = req.headers['stripe-signature']
+    try {
+        if (!stripeService.isStripeConfigured()) {
+            return res.status(503).send('Stripe not configured')
+        }
+        const event = stripeService.constructWebhookEvent(req.body, signature)
+
+        if (
+            event.type === 'checkout.session.completed' ||
+            event.type === 'checkout.session.async_payment_succeeded'
+        ) {
+            const session = event.data.object
+            const result = await fulfillCheckoutSession(session)
+            console.log(`💳 Checkout ${session.id}:`, result)
+        } else if (event.type === 'checkout.session.async_payment_failed') {
+            console.warn('💳 Async payment failed:', event.data.object?.id)
+        }
+
+        res.json({ received: true })
+    } catch (err) {
+        console.error('Stripe webhook error:', err.message)
+        res.status(400).send(`Webhook Error: ${err.message}`)
+    }
+})
+
 app.use(express.json({ limit: '50mb' }))
 app.use(express.static(path.join(__dirname, 'public')))
 
 app.use('/auth', authRoutes)
 app.use('/admin', authenticateToken, requireAdmin, adminRoutes)
+app.use('/billing', authenticateToken, billingRoutes)
 
 const activeConnections = new Map()
 registerActiveConnections(activeConnections)
@@ -91,6 +123,87 @@ const __dbg = (location, message, data) => { try { fetch('http://127.0.0.1:7809/
 // #endregion
 
 const interimTranslationThrottle = new Map()
+
+async function endStreamingForBalance(socket, connection, reason = 'balance_depleted') {
+    if (!connection) return
+    connection.isStreaming = false
+
+    const recognizeStream = streamingSessions.get(socket.id)
+    if (recognizeStream) {
+        speechToTextService.endStreamingRecognition(recognizeStream)
+        streamingSessions.delete(socket.id)
+    }
+    cleanupSocketStreamState(socket.id)
+    stopMetering(connection)
+
+    socket.emit('balanceDepleted', {
+        message: 'Your prepaid hours have run out. Purchase more hours to continue.',
+        reason,
+    })
+    socket.emit('error', {
+        message: 'Prepaid hours depleted. Purchase more hours to continue streaming.',
+        code: 'BALANCE_DEPLETED',
+    })
+}
+
+async function ensureStreamingAllowed(socket, connection) {
+    if (!socket.user?.id || !connection) return true
+    if (connection.streamStartTime) return true
+
+    const balance = await User.getBalance(socket.user.id)
+    if (!balance) return true
+
+    if (balance.billingTier === 'complimentary') {
+        connection.streamStartTime = Date.now()
+        if (!connection.sessionCounted) {
+            connection.sessionCounted = true
+            User.incrementSessionCount(socket.user.id).catch(() => { })
+        }
+        await startMetering(connection, socket, {
+            onLowBalance: () => {},
+            onDepleted: async () => {},
+        })
+        return true
+    }
+
+    if (balance.balanceSeconds <= 0) {
+        socket.emit('balanceDepleted', {
+            message: 'Your prepaid hours have run out. Purchase more hours to continue.',
+            reason: 'no_balance',
+            balanceSeconds: 0,
+        })
+        return false
+    }
+
+    connection.streamStartTime = Date.now()
+    if (!connection.sessionCounted) {
+        connection.sessionCounted = true
+        User.incrementSessionCount(socket.user.id).catch(() => { })
+    }
+
+    await startMetering(connection, socket, {
+        onLowBalance: (balanceSeconds, threshold) => {
+            socket.emit('balanceWarning', { balanceSeconds, thresholdSeconds: threshold })
+        },
+        onDepleted: async () => {
+            await endStreamingForBalance(socket, connection)
+        },
+    })
+    return true
+}
+
+async function finishStreamingUsage(socket, connection) {
+    if (!connection) return
+    await reconcileMetering(connection, socket)
+    if (connection.streamStartTime && socket.user?.id) {
+        const usageMinutes = (Date.now() - connection.streamStartTime) / 60000
+        if (usageMinutes >= 0.1) {
+            User.addUsageMinutes(socket.user.id, usageMinutes).catch(() => { })
+        }
+        connection.streamStartTime = null
+    }
+    stopMetering(connection)
+}
 
 // ============================================================================
 // CONTENT HASH DEDUPLICATION - Prevents duplicates from overlapping streams
@@ -1127,19 +1240,13 @@ io.on('connection', async (socket) => {
 
             const connection = activeConnections.get(socket.id)
             if (connection) {
-                connection.isStreaming = true
                 connection.sourceLanguage = sourceLanguage
                 connection.messageCount++
                 connection.lastActivity = Date.now()
 
-                // Track streaming session start
-                if (!connection.streamStartTime) {
-                    connection.streamStartTime = Date.now();
-                    if (socket.user?.id && !connection.sessionCounted) {
-                        connection.sessionCounted = true;
-                        User.incrementSessionCount(socket.user.id).catch(() => { });
-                    }
-                }
+                const allowed = await ensureStreamingAllowed(socket, connection)
+                if (!allowed) return
+                connection.isStreaming = true
             }
 
             const currentConnection = activeConnections.get(socket.id)
@@ -1228,18 +1335,12 @@ io.on('connection', async (socket) => {
             }
 
             if (connection) {
-                connection.isStreaming = true
                 connection.sourceLanguage = sourceLanguage
                 connection.speechEndTimeout = speechEndTimeout
 
-                // Track streaming session start
-                if (!connection.streamStartTime) {
-                    connection.streamStartTime = Date.now();
-                    if (socket.user?.id && !connection.sessionCounted) {
-                        connection.sessionCounted = true;
-                        User.incrementSessionCount(socket.user.id).catch(() => { });
-                    }
-                }
+                const allowed = await ensureStreamingAllowed(socket, connection)
+                if (!allowed) return
+                connection.isStreaming = true
             }
 
             const currentConnection = activeConnections.get(socket.id)
@@ -1369,14 +1470,7 @@ io.on('connection', async (socket) => {
             // Background processing of accumulated transcript
             handleBackgroundProcessing(socket.id, connection);
 
-            // Record usage minutes
-            if (connection.streamStartTime && socket.user?.id) {
-                const usageMinutes = (Date.now() - connection.streamStartTime) / 60000;
-                if (usageMinutes >= 0.1) {
-                    User.addUsageMinutes(socket.user.id, usageMinutes).catch(() => { });
-                }
-                connection.streamStartTime = null;
-            }
+            await finishStreamingUsage(socket, connection)
         }
 
         // End Google Cloud streaming session
@@ -1523,12 +1617,8 @@ io.on('connection', async (socket) => {
             handleBackgroundProcessing(socket.id, connection);
         }
 
-        // Record usage minutes if user was streaming when disconnected
-        if (connection?.streamStartTime && socket.user?.id) {
-            const usageMinutes = (Date.now() - connection.streamStartTime) / 60000;
-            if (usageMinutes >= 0.1) {
-                User.addUsageMinutes(socket.user.id, usageMinutes).catch(() => { });
-            }
+        if (connection) {
+            await finishStreamingUsage(socket, connection)
         }
 
         // Clean up streaming session

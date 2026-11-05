@@ -23,6 +23,9 @@ const serializeUser = (user, extras = {}) => ({
   totpEnabled: user.totpEnabled,
   totalSessions: user.totalSessions || 0,
   totalUsageMinutes: user.totalUsageMinutes || 0,
+  balanceSeconds: typeof user.balanceSeconds === 'number' ? user.balanceSeconds : 0,
+  billingTier: user.billingTier || 'standard',
+  preferredCurrency: user.preferredCurrency || 'cad',
   isAdmin: isAdminEmail(user.email),
   ...extras,
 });
@@ -428,6 +431,7 @@ router.post('/logout', authenticateToken, (req, res) => {
  */
 router.get('/me', authenticateToken, async (req, res) => {
   try {
+    await User.ensureBillingDefaults(req.user.id);
     const user = await User.findUserById(req.user.id);
     if (!user) {
       return res.status(404).json({
