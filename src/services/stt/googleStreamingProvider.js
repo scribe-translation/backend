@@ -8,6 +8,18 @@ const {
   parseStreamingResponse,
 } = require('../streamingRecognitionConfig');
 
+let logger = null;
+const getLogger = () => {
+  if (!logger) {
+    try {
+      logger = require('../../utils/logger').logger;
+    } catch {
+      logger = console;
+    }
+  }
+  return logger;
+};
+
 class GoogleStreamingProvider {
   constructor() {
     this.projectId = config.GOOGLE_CLOUD_PROJECT_ID;
@@ -61,8 +73,10 @@ class GoogleStreamingProvider {
       this.credentials = null;
       return this.credentials;
     } catch (error) {
-      console.error('❌ Failed to load credentials:', error);
-      console.log('⚠️ Falling back to default service account');
+      getLogger().warn({
+        provider: 'google',
+        error: error.message,
+      }, 'Failed to load Google credentials - falling back to default service account');
       this.credentials = null;
       return this.credentials;
     }
@@ -111,11 +125,15 @@ class GoogleStreamingProvider {
       sampleRateHertz: 48000,
     });
 
-    console.log(`🔍 [V2 API] Selected model for ${languageCode}: ${model} (interim results)`);
+    getLogger().info({
+      provider: 'google',
+      languageCode,
+      model,
+      interimResults: true,
+      sampleRate: 48000,
+    }, 'Starting Google streaming recognition');
 
     const recognizeStream = client._streamingRecognize();
-
-    console.log(`✅ [V2 API] Stream created with model "${model}" for ${languageCode}`);
 
     const streamHealth = {
       lastDataTime: Date.now(),
@@ -131,14 +149,20 @@ class GoogleStreamingProvider {
     const DATA_TIMEOUT = 30000;
 
     const rotationArmTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Rotation arm timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      getLogger().debug({
+        provider: 'google',
+        streamAge: Math.round((Date.now() - streamHealth.createdAt) / 1000),
+      }, 'Stream rotation arm timer fired');
       if (callbacks && callbacks.onRotationArm && typeof callbacks.onRotationArm === 'function') {
         callbacks.onRotationArm();
       }
     }, ROTATION_ARM_TIME);
 
     const forceFinalizeTimer = setTimeout(() => {
-      console.log(`⏰ [STREAM] Force-finalize timer fired at ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      getLogger().debug({
+        provider: 'google',
+        streamAge: Math.round((Date.now() - streamHealth.createdAt) / 1000),
+      }, 'Force-finalize timer fired');
       if (callbacks && callbacks.onForceFinalize && typeof callbacks.onForceFinalize === 'function') {
         callbacks.onForceFinalize();
       }
@@ -151,7 +175,11 @@ class GoogleStreamingProvider {
       const streamAge = now - streamHealth.createdAt;
 
       if (timeSinceAudio < 5000 && timeSinceData > DATA_TIMEOUT) {
-        console.warn(`⚠️ [STREAM] Health check failed: No data for ${timeSinceData / 1000}s while audio still flowing. Forcing restart.`);
+        getLogger().warn({
+          provider: 'google',
+          timeSinceData: Math.round(timeSinceData / 1000),
+          timeSinceAudio: Math.round(timeSinceAudio / 1000),
+        }, 'Google stream health check failed - no data while audio flowing, forcing restart');
         clearInterval(healthCheckInterval);
         if (callbacks && callbacks.onRestart && typeof callbacks.onRestart === 'function') {
           callbacks.onRestart();
@@ -159,7 +187,12 @@ class GoogleStreamingProvider {
       }
 
       if (streamAge > 0 && streamAge % 60000 < HEALTH_CHECK_INTERVAL) {
-        console.log(`📊 [STREAM] Health: age=${Math.round(streamAge / 1000)}s, lastData=${Math.round(timeSinceData / 1000)}s ago, lastAudio=${Math.round(timeSinceAudio / 1000)}s ago`);
+        getLogger().debug({
+          provider: 'google',
+          streamAge: Math.round(streamAge / 1000),
+          timeSinceData: Math.round(timeSinceData / 1000),
+          timeSinceAudio: Math.round(timeSinceAudio / 1000),
+        }, 'Google stream health check');
       }
     }, HEALTH_CHECK_INTERVAL);
 
@@ -181,13 +214,12 @@ class GoogleStreamingProvider {
     });
 
     recognizeStream.on('error', (error) => {
-      console.error('❌ Google Cloud streaming error:', error);
-      console.error('Error details:', {
-        code: error.code,
-        message: error.message,
+      getLogger().error({
+        provider: 'google',
+        errorCode: error.code,
+        error: error.message,
         details: error.details,
-        metadata: error.metadata,
-      });
+      }, 'Google Cloud streaming error occurred');
 
       clearTimeout(rotationArmTimer);
       clearTimeout(forceFinalizeTimer);
@@ -222,7 +254,10 @@ class GoogleStreamingProvider {
     });
 
     recognizeStream.on('end', () => {
-      console.log(`📊 [STREAM] Stream ended after ${(Date.now() - streamHealth.createdAt) / 1000}s`);
+      getLogger().info({
+        provider: 'google',
+        duration: Math.round((Date.now() - streamHealth.createdAt) / 1000),
+      }, 'Google stream ended');
       recognizeStream.destroyed = true;
       clearTimeout(rotationArmTimer);
       clearTimeout(forceFinalizeTimer);
@@ -245,7 +280,10 @@ class GoogleStreamingProvider {
         }
         recognizeStream.write(buildAudioRequest(audioBuffer));
       } catch (error) {
-        console.error('❌ Error writing to stream:', error);
+        getLogger().error({
+          provider: 'google',
+          error: error.message,
+        }, 'Error writing audio to Google stream');
       }
     }
   }
