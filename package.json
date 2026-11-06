@@ -12,6 +12,9 @@
     "migrate:session-code": "node src/migrations/rename-userCode-to-sessionCode.js",
     "migrate:session-code:dry-run": "node src/migrations/rename-userCode-to-sessionCode.js --dry-run",
     "test": "node --test src/billing/constants.test.js src/models/flagTargeting.test.js src/services/interimTranslationThrottle.test.js src/services/streamingRecognitionConfig.test.js src/services/stt/deepgramResults.test.js src/services/stt/deepgramLanguage.test.js src/services/stt/createProvider.test.js src/utils/languageCodeMapper.test.js",
+    "logs": "node scripts/view-logs.js",
+    "logs:follow": "node scripts/view-logs.js -f",
+    "logs:errors": "cat logs/app.log | grep '\"level\":\"error\"' | node scripts/view-logs.js",
     "kill": "bash shutdown.sh",
     "cleanup": "pkill -f 'firebase.*emulators' || true"
   },
