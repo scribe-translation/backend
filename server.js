@@ -6,6 +6,9 @@ const crypto = require('crypto')
 const path = require('path')
 require('dotenv').config()
 const config = require('./src/config')
+const { logger } = require('./src/utils/logger')
+const requestLoggerMiddleware = require('./src/middleware/requestLogger')
+const { attachSocketLogger } = require('./src/middleware/socketLogger')
 const { authenticateSocket, authenticateToken, requireAdmin } = require('./src/middleware/auth')
 const authRoutes = require('./src/routes/auth')
 const adminRoutes = require('./src/routes/admin')
@@ -72,8 +75,11 @@ io.use(authenticateSocket)
 // Stripe webhooks need the raw body for signature verification
 app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.headers['stripe-signature']
+    const startTime = Date.now()
+    
     try {
         if (!stripeService.isStripeConfigured()) {
+            logger.warn({ path: '/billing/webhook' }, 'Stripe webhook received but Stripe not configured')
             return res.status(503).send('Stripe not configured')
         }
         const event = stripeService.constructWebhookEvent(req.body, signature)
@@ -84,19 +90,33 @@ app.post('/billing/webhook', express.raw({ type: 'application/json' }), async (r
         ) {
             const session = event.data.object
             const result = await fulfillCheckoutSession(session)
-            console.log(`💳 Checkout ${session.id}:`, result)
+            logger.info({
+                eventType: event.type,
+                sessionId: session.id,
+                result,
+                duration: Date.now() - startTime,
+            }, 'Stripe checkout session fulfilled')
         } else if (event.type === 'checkout.session.async_payment_failed') {
-            console.warn('💳 Async payment failed:', event.data.object?.id)
+            logger.warn({
+                eventType: event.type,
+                sessionId: event.data.object?.id,
+            }, 'Stripe async payment failed')
         }
 
         res.json({ received: true })
     } catch (err) {
-        console.error('Stripe webhook error:', err.message)
+        logger.error({
+            error: err.message,
+            stack: err.stack,
+            path: '/billing/webhook',
+            duration: Date.now() - startTime,
+        }, 'Stripe webhook error')
         res.status(400).send(`Webhook Error: ${err.message}`)
     }
 })
 
 app.use(express.json({ limit: '50mb' }))
+app.use(requestLoggerMiddleware)
 app.use(express.static(path.join(__dirname, 'public')))
 
 app.use('/auth', authRoutes)
@@ -117,10 +137,7 @@ const typingIndicatorTimeouts = new Map() // Track typing indicator timeouts per
 const lastInterimBySocket = new Map() // Last interim transcript per socket (force-finalize fallback)
 const forceFinalizeSafetyTimers = new Map() // Safety timers for force-finalize ack
 const rotatingStreams = new Map() // Prevent concurrent stream rotations per socket
-// #region agent log
 let __dbgAudioCount = 0
-const __dbg = (location, message, data) => { try { fetch('http://127.0.0.1:7809/ingest/3c5ff2ee-7cbf-4a34-a4e1-f6d7b649a94d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a86d7b'},body:JSON.stringify({sessionId:'a86d7b',location,message,data,timestamp:Date.now()})}).catch(()=>{}) } catch(e){} }
-// #endregion
 
 const interimTranslationThrottle = new Map()
 
@@ -320,7 +337,12 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
     }
 
     if (isDuplicateFinal(socket.id, bubbleId, trimmed)) {
-        console.log(`⏭️ Skipping duplicate final from ${origin} (socket=${socket.id}, bubble=${bubbleId || 'none'})`);
+        logger.debug({
+            socketId: socket.id,
+            bubbleId: bubbleId || 'none',
+            origin,
+            reason: 'duplicate',
+        }, 'Skipping duplicate final transcript')
         return { processed: false, reason: 'duplicate' };
     }
 
@@ -333,9 +355,11 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
 
     const currentConnection = activeConnections.get(socket.id);
     if (!currentConnection?.sessionCode) {
-        console.warn(
-            `⚠️ Buffered final without sessionCode for socket ${socket.id} (storage only, no broadcast)`
-        );
+        logger.warn({
+            socketId: socket.id,
+            hasTranscript: !!trimmed,
+            transcriptLength: trimmed.length,
+        }, 'Buffered final transcript without sessionCode - storage only, no broadcast')
         return { processed: true, languages: 0, broadcast: false };
     }
 
@@ -343,9 +367,15 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
     const sessionCodeConnections = getSessionConnectionIds(sessionCode);
     const listenersByLanguage = getListenersByLanguage(sessionCode);
 
-    console.log(
-        `📝 Final transcript from ${origin}: "${trimmed.substring(0, 50)}${trimmed.length > 50 ? '...' : ''}" → ${listenersByLanguage.size} language(s)`
-    );
+    logger.info({
+        origin,
+        socketId: socket.id,
+        sessionCode,
+        transcriptLength: trimmed.length,
+        transcriptPreview: trimmed.substring(0, 50),
+        languageCount: listenersByLanguage.size,
+        bubbleId,
+    }, 'Final transcript processed')
 
     if (listenersByLanguage.size === 0) {
         const sessionConnections = getSessionConnectionIds(sessionCode).map((socketId) => {
@@ -356,7 +386,11 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
                 targetLanguage: conn?.targetLanguage || null
             };
         });
-        console.log(`⚠️ No listeners for session ${sessionCode}:`, sessionConnections);
+        logger.warn({
+            sessionCode,
+            sessionConnections,
+            connectionCount: sessionConnections.length,
+        }, 'No listeners found for session')
     }
 
     sessionCodeConnections.forEach((socketId) => {
@@ -394,7 +428,14 @@ async function processFinalTranscript({ socket, transcript, sourceLanguage, bubb
                 });
             }
         } catch (translationError) {
-            console.error(`Translation error (${origin}):`, translationError);
+            logger.error({
+                origin,
+                error: translationError.message,
+                stack: translationError.stack,
+                sessionCode,
+                sourceLanguage,
+                bubbleId,
+            }, 'Translation failed for final transcript')
             getTranslationConnectionIds(sessionCode).forEach((socketId) => {
                 const targetSocket = io.sockets.sockets.get(socketId);
                 if (targetSocket) {
@@ -481,12 +522,13 @@ class MessageQueue {
         if (!listenerKey) {
             listenerKey = this.resolveListenerKey(socketId, connection)
         }
-        if (!listenerKey) {
-            console.warn(`⚠️ No listener key bound for socket ${socketId}, skipping queue`, {
+            if (!listenerKey) {
+            logger.warn({
+                socketId,
                 sessionCode: connection?.sessionCode ?? 'unknown',
                 targetLanguage: connection?.targetLanguage ?? 'unknown',
                 hasConnection: !!connection
-            })
+            }, 'No listener key bound for socket, skipping queue')
             return null
         }
 
@@ -650,12 +692,18 @@ async function handleBackgroundProcessing(socketId, connectionData) {
     }
 
     if (!connectionData?.userId) {
-        console.log(`ℹ️ Skipping transcription storage for socket ${socketId} (no userId; buffer retained)`);
+        logger.debug({
+            socketId,
+            bufferLength: accumulatedText.length,
+        }, 'Skipping transcription storage - no userId, buffer retained')
         return;
     }
 
     if (!prefs.storeText) {
-        console.log(`ℹ️ Skipping transcription storage for user ${connectionData.userId} (user opted out)`);
+        logger.debug({
+            socketId,
+            userId: connectionData.userId,
+        }, 'Skipping transcription storage - user opted out')
         sessionTranscripts.delete(socketId);
         return;
     }
@@ -665,8 +713,14 @@ async function handleBackgroundProcessing(socketId, connectionData) {
     sessionTranscripts.delete(socketId);
 
     (async () => {
+        const startTime = Date.now()
         try {
-            console.log(`📝 Processing transcription background task for user ${connectionData.userId}...`);
+            logger.info({
+                socketId,
+                userId: connectionData.userId,
+                characterCount: accumulatedText.length,
+                sourceLanguage: connectionData.sourceLanguage,
+            }, 'Starting background transcription processing')
 
             const sessionData = await Session.create({
                 userId: connectionData.userId,
@@ -680,7 +734,11 @@ async function handleBackgroundProcessing(socketId, connectionData) {
                 try {
                     summary = await aiService.generateSummary(accumulatedText);
                 } catch (e) {
-                    console.error('⚠️ AI generation error ignored in background task:', e);
+                    logger.warn({
+                        error: e.message,
+                        userId: connectionData.userId,
+                        sessionId: sessionData.id,
+                    }, 'AI generation error in background task')
                 }
             }
 
@@ -688,9 +746,21 @@ async function handleBackgroundProcessing(socketId, connectionData) {
                 await Session.update(sessionData.id, {
                     summary
                 });
-                console.log(`✅ Transcription processed and updated with AI for ${connectionData.userId}`);
+                logger.info({
+                    socketId,
+                    userId: connectionData.userId,
+                    sessionId: sessionData.id,
+                    duration: Date.now() - startTime,
+                    hasSummary: true,
+                }, 'Transcription processed with AI summary')
             } else {
-                console.log(`✅ Transcription saved without AI content for ${connectionData.userId}`);
+                logger.info({
+                    socketId,
+                    userId: connectionData.userId,
+                    sessionId: sessionData.id,
+                    duration: Date.now() - startTime,
+                    hasSummary: false,
+                }, 'Transcription saved without AI content')
             }
         } catch (error) {
             const existing = sessionTranscripts.get(socketId) || '';
@@ -698,7 +768,13 @@ async function handleBackgroundProcessing(socketId, connectionData) {
                 socketId,
                 existing ? `${existing}\n${accumulatedText}` : accumulatedText
             );
-            console.error(`❌ Background processing failed for ${connectionData.userId}:`, error.message);
+            logger.error({
+                socketId,
+                userId: connectionData.userId,
+                error: error.message,
+                stack: error.stack,
+                duration: Date.now() - startTime,
+            }, 'Background transcription processing failed')
         }
     })();
 }
@@ -761,7 +837,13 @@ const emitConnectionCount = (sessionCode = null) => {
 async function processTranslations(translationConnections, transcript, sourceLanguage, bubbleId) {
     try {
     } catch (translationError) {
-        console.error('Translation error:', translationError)
+        logger.error({
+            error: translationError.message,
+            stack: translationError.stack,
+            sourceLanguage,
+            bubbleId,
+            listenerCount: translationConnections.length,
+        }, 'Translation error in processTranslations')
         translationConnections.forEach(socketId => {
             const targetSocket = io.sockets.sockets.get(socketId)
             if (targetSocket) {
@@ -822,9 +904,13 @@ async function rotateStream(socket, options = {}) {
         audioBufferDuringRestart.set(socketId, [])
     }
 
-    // #region agent log
-    __dbg('server.js:rotateStream', 'ROTATE entry', { socketId, emergency, armed: speechToTextService.isRotationArmed(socketId), hasOldStream: !!oldStream })
-    // #endregion
+    logger.debug({
+        socketId,
+        emergency,
+        armed: speechToTextService.isRotationArmed(socketId),
+        hasOldStream: !!oldStream,
+        sourceLanguage,
+    }, 'Stream rotation started')
 
     try {
         let newStream = null
@@ -840,7 +926,13 @@ async function rotateStream(socket, options = {}) {
                 )
             } catch (err) {
                 retries++
-                console.error(`❌ rotateStream: failed to create new stream (attempt ${retries}):`, err)
+                logger.error({
+                    socketId,
+                    attempt: retries,
+                    maxRetries,
+                    error: err.message,
+                    sourceLanguage,
+                }, 'Failed to create new stream during rotation')
                 if (retries < maxRetries) {
                     await new Promise((resolve) => setTimeout(resolve, 500))
                 }
@@ -848,7 +940,11 @@ async function rotateStream(socket, options = {}) {
         }
 
         if (!newStream) {
-            console.error(`❌ rotateStream: all retries failed for ${socketId}, keeping old stream`)
+            logger.error({
+                socketId,
+                retriesAttempted: retries,
+                sourceLanguage,
+            }, 'All rotation retries failed, keeping old stream')
             return
         }
 
@@ -865,19 +961,23 @@ async function rotateStream(socket, options = {}) {
             speechToTextService.sendAudioToStream(newStream, audioBuffer)
         }
 
-        console.log(`✅ [ROTATE] Stream rotated for ${socketId}, flushed ${bufferedAudio.length} buffered chunks`)
-        // #region agent log
-        __dbg('server.js:rotateStream', 'ROTATE success', { socketId, flushed: bufferedAudio.length, newDestroyed: !!newStream.destroyed })
-        // #endregion
+        logger.info({
+            socketId,
+            flushedChunks: bufferedAudio.length,
+            sourceLanguage,
+            emergency,
+        }, 'Stream rotation completed successfully')
     } catch (err) {
-        console.error(`❌ rotateStream failed for ${socketId}:`, err)
+        logger.error({
+            socketId,
+            error: err.message,
+            stack: err.stack,
+            sourceLanguage,
+        }, 'Stream rotation failed')
     } finally {
         restartingStreams.delete(socketId)
         audioBufferDuringRestart.delete(socketId)
         rotatingStreams.delete(socketId)
-        // #region agent log
-        __dbg('server.js:rotateStream', 'ROTATE finally cleanup', { socketId, restartingStillSet: restartingStreams.has(socketId), rotatingStillSet: rotatingStreams.has(socketId) })
-        // #endregion
     }
 }
 
@@ -937,13 +1037,21 @@ function createStreamCallbacks(socket) {
                 )
 
                 if (speechToTextService.isRotationArmed(socket.id)) {
-                    console.log(`🔄 [ROTATE] Final received, rotating stream for ${socket.id}`)
+                    logger.debug({
+                        socketId: socket.id,
+                        bubbleId: activeBubbleId,
+                    }, 'Final received, initiating stream rotation')
                     await rotateStream(socket)
                 }
             }
         },
         onError: (error) => {
-            console.error('❌ STT streaming error:', error)
+            logger.error({
+                socketId: socket.id,
+                error: error.message,
+                errorCode: error.code,
+                stack: error.stack,
+            }, 'STT streaming error occurred')
             if (error.code === 14 || (error.message && error.message.includes('UNAVAILABLE'))) {
                 setTimeout(async () => {
                     if (socket.connected) {
@@ -967,7 +1075,9 @@ function createStreamCallbacks(socket) {
             if (!speechToTextService.supportsStreamRotation()) return
             if (speechToTextService.isRotationArmed(socket.id)) return
             speechToTextService.armRotation(socket.id)
-            console.log(`⏰ [ROTATE] Rotation armed for ${socket.id} at 3:00`)
+            logger.debug({
+                socketId: socket.id,
+            }, 'Stream rotation armed at 3:00 mark')
         },
         onForceFinalize: () => {
             if (!speechToTextService.supportsStreamRotation()) return
@@ -1013,12 +1123,14 @@ function createStreamCallbacks(socket) {
 
 io.on('connection', async (socket) => {
 
-    // Log new connection
-    console.log(`🔗 New connection: ${socket.id} (user: ${socket.user?.email || 'listener'}, sessionCode: ${socket.sessionCode})`);
-    console.log(`📊 Total connections before add: ${activeConnections.size}`);
+    logger.info({
+        socketId: socket.id,
+        userId: socket.user?.id,
+        userEmail: socket.user?.email,
+        sessionCode: socket.sessionCode,
+        connectionsBeforeAdd: activeConnections.size,
+    }, 'New socket connection established')
 
-    // Check for stale connections from same user and clean them up
-    // This handles both authenticated users (speakers) and listeners (sessionCode only)
     const staleConnections = [];
 
     activeConnections.forEach((conn, socketId) => {
@@ -1041,12 +1153,14 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // Clean up stale connections immediately
     if (staleConnections.length > 0) {
-        const identifier = socket.user?.email || `listener-${socket.sessionCode}`;
-        console.log(`🧹 Cleaning up ${staleConnections.length} stale connections for ${identifier}`);
+        logger.info({
+            staleConnectionCount: staleConnections.length,
+            userEmail: socket.user?.email,
+            sessionCode: socket.sessionCode,
+            staleSocketIds: staleConnections,
+        }, 'Cleaning up stale connections')
         staleConnections.forEach(socketId => {
-            console.log(`  - Removing stale socket: ${socketId}`);
             const conn = activeConnections.get(socketId);
             if (conn) {
                 handleBackgroundProcessing(socketId, conn);
@@ -1093,24 +1207,35 @@ io.on('connection', async (socket) => {
         sessionCounted: false   // Prevent double-counting sessions
     })
 
-    console.log(`📊 Total connections after add: ${activeConnections.size}`);
+    const connection = activeConnections.get(socket.id)
+    attachSocketLogger(socket, connection)
 
-    // Update lastActive for authenticated users
+    logger.info({
+        socketId: socket.id,
+        userId: socket.user?.id,
+        userEmail: socket.user?.email,
+        sessionCode: socket.sessionCode,
+        totalConnections: activeConnections.size,
+    }, 'Connection added to active connections')
+
     if (socket.user?.id) {
         try {
             await User.updateLastActive(socket.user.id);
         } catch (err) {
-            console.warn('⚠️ Failed to update lastActive:', err.message);
+            logger.warn({
+                userId: socket.user.id,
+                error: err.message,
+            }, 'Failed to update lastActive timestamp')
         }
     }
 
-    // Set up heartbeat mechanism
-    // Server timeout is a safety net - clients should detect and reconnect faster
-    const connection = activeConnections.get(socket.id)
     if (connection) {
-        // Set initial ping timeout (45 seconds - acts as safety net, client should reconnect faster)
         connection.pingTimeout = setTimeout(() => {
-            console.log(`💔 Heartbeat timeout for socket ${socket.id}, disconnecting...`)
+            logger.warn({
+                socketId: socket.id,
+                userId: socket.user?.id,
+                sessionCode: socket.sessionCode,
+            }, 'Heartbeat timeout - disconnecting socket')
             socket.disconnect(true)
         }, 45000)
     }
@@ -1146,13 +1271,16 @@ io.on('connection', async (socket) => {
                 clearTimeout(connection.pingTimeout)
             }
 
-            // Adaptive timeout based on connection quality (increased - acts as safety net)
-            // Client should detect and reconnect faster (15s) before these timeouts trigger
             const timeoutDuration = connection.connectionQuality === 'critical' ? 25000 :
                 connection.connectionQuality === 'poor' ? 35000 : 45000
 
             connection.pingTimeout = setTimeout(() => {
-                console.log(`💔 Heartbeat timeout for socket ${socket.id} (quality: ${connection.connectionQuality}), disconnecting...`)
+                logger.warn({
+                    socketId: socket.id,
+                    userId: socket.user?.id,
+                    connectionQuality: connection.connectionQuality,
+                    timeoutDuration,
+                }, 'Heartbeat timeout - disconnecting socket')
                 socket.disconnect(true)
             }, timeoutDuration)
         }
@@ -1204,12 +1332,20 @@ io.on('connection', async (socket) => {
                     })
 
                 } catch (error) {
-                    console.error('Error refreshing token:', error)
+                    logger.error({
+                        socketId: socket.id,
+                        error: error.message,
+                        stack: error.stack,
+                    }, 'Token refresh failed')
                     socket.emit('tokenRefreshError', { message: 'Token refresh failed' })
                 }
             })
         } catch (error) {
-            console.error('Token refresh error:', error)
+            logger.error({
+                socketId: socket.id,
+                error: error.message,
+                stack: error.stack,
+            }, 'Token refresh error')
             socket.emit('tokenRefreshError', { message: 'Token refresh failed' })
         }
     })
@@ -1221,7 +1357,12 @@ io.on('connection', async (socket) => {
                 storeText: !!prefs.storeText,
                 generateSummary: !!prefs.generateSummary
             };
-            console.log(`⚙️ Updated recording prefs for ${socket.id}:`, connection.recordingPrefs);
+            logger.info({
+                socketId: socket.id,
+                userId: socket.user?.id,
+                storeText: connection.recordingPrefs.storeText,
+                generateSummary: connection.recordingPrefs.generateSummary,
+            }, 'Updated recording preferences')
         }
     });
 
@@ -1267,9 +1408,13 @@ io.on('connection', async (socket) => {
             }
 
         } catch (error) {
-            console.error('Error processing speech transcription:', error)
+            logger.error({
+                socketId: socket.id,
+                userId: socket.user?.id,
+                error: error.message,
+                stack: error.stack,
+            }, 'Error processing speech transcription')
 
-            // Track error for connection quality monitoring
             const connection = activeConnections.get(socket.id)
             if (connection) {
                 connection.errorCount++
@@ -1373,23 +1518,25 @@ io.on('connection', async (socket) => {
                                     createStreamCallbacks(socket)
                                 )
 
-                                // Store the stream for this socket
                                 if (recognizeStream) {
                                     streamingSessions.set(socket.id, recognizeStream);
                                 } else {
-                                    console.error('❌ Stream creation returned null/undefined for socket:', socket.id);
+                                    logger.error({
+                                        socketId: socket.id,
+                                        sourceLanguage,
+                                    }, 'Stream creation returned null/undefined')
                                 }
                             } catch (streamError) {
-                                console.error('❌ Failed to create streaming recognition:', streamError);
-                                console.error('Error details:', {
-                                    message: streamError.message,
+                                logger.error({
+                                    socketId: socket.id,
+                                    sourceLanguage,
+                                    error: streamError.message,
                                     stack: streamError.stack,
-                                    sourceLanguage: sourceLanguage
-                                });
+                                }, 'Failed to create streaming recognition')
                                 socket.emit('error', {
                                     message: 'Failed to start speech recognition: ' + streamError.message
                                 });
-                                return; // Don't try to send audio if stream creation failed
+                                return;
                             }
                         }
 
@@ -1398,41 +1545,49 @@ io.on('connection', async (socket) => {
                             const buffer = audioBufferDuringRestart.get(socket.id) || [];
                             buffer.push(audioBuffer);
                             audioBufferDuringRestart.set(socket.id, buffer);
-                            // Limit buffer size to prevent memory issues (keep last 100 chunks ~2 seconds of audio)
                             if (buffer.length > 100) {
                                 buffer.shift();
                             }
-                            // #region agent log
-                            if (buffer.length % 25 === 1) __dbg('server.js:audio', 'AUDIO buffering during restart', { socketId: socket.id, bufferLen: buffer.length, rotating: !!rotatingStreams.get(socket.id) })
-                            // #endregion
-                            return; // Don't try to send to stream while restarting
+                            if (buffer.length % 25 === 1) {
+                                logger.debug({
+                                    socketId: socket.id,
+                                    bufferLength: buffer.length,
+                                    rotating: !!rotatingStreams.get(socket.id),
+                                }, 'Buffering audio during stream restart')
+                            }
+                            return;
                         }
 
                         // Send audio chunk to Google Cloud streaming (only to active stream)
                         const recognizeStream = streamingSessions.get(socket.id);
                         if (recognizeStream && !recognizeStream.destroyed) {
-                            // Send audio only to active stream (standby streams don't receive audio until activated)
                             speechToTextService.sendAudioToStream(recognizeStream, audioBuffer);
-                            // #region agent log
-                            if ((++__dbgAudioCount) % 150 === 0) __dbg('server.js:audio', 'AUDIO sent to active stream', { socketId: socket.id, counter: __dbgAudioCount })
-                            // #endregion
+                            if ((++__dbgAudioCount) % 150 === 0) {
+                                logger.debug({
+                                    socketId: socket.id,
+                                    audioChunkCounter: __dbgAudioCount,
+                                }, 'Audio sent to active stream')
+                            }
                         } else {
-                            // #region agent log
-                            __dbg('server.js:audio', 'AUDIO no valid stream', { socketId: socket.id, hasStream: !!recognizeStream, destroyed: recognizeStream?.destroyed, restarting: !!restartingStreams.get(socket.id), sessionExists: streamingSessions.has(socket.id) })
-                            // #endregion
-                            // Only log error if we're not in a transient state
                             if (!restartingStreams.get(socket.id)) {
-                                console.error('❌ No valid stream found for socket:', socket.id, {
+                                logger.error({
+                                    socketId: socket.id,
                                     hasStream: !!recognizeStream,
                                     isDestroyed: recognizeStream?.destroyed,
-                                    sessionExists: streamingSessions.has(socket.id)
-                                });
+                                    sessionExists: streamingSessions.has(socket.id),
+                                }, 'No valid stream found for socket')
                             }
                         }
                     } else {
                     }
                 } catch (speechError) {
-                    console.error('❌ Google Cloud Speech-to-Text error:', speechError)
+                    logger.error({
+                        socketId: socket.id,
+                        userId: socket.user?.id,
+                        error: speechError.message,
+                        stack: speechError.stack,
+                        sourceLanguage,
+                    }, 'Google Cloud Speech-to-Text error')
                     socket.emit('error', {
                         message: 'Speech recognition failed: ' + speechError.message
                     })
@@ -1456,7 +1611,12 @@ io.on('connection', async (socket) => {
             }
 
         } catch (error) {
-            console.error('Error processing Google Cloud speech transcription:', error)
+            logger.error({
+                socketId: socket.id,
+                userId: socket.user?.id,
+                error: error.message,
+                stack: error.stack,
+            }, 'Error processing Google Cloud speech transcription')
             socket.emit('error', { message: 'Failed to process speech transcription: ' + error.message })
         }
     })
@@ -1492,11 +1652,13 @@ io.on('connection', async (socket) => {
         }
     })
 
-    // Handle client request for stream restart (e.g., when client detects hung stream)
     socket.on('requestStreamRestart', async (data) => {
-        console.log(`🔄 Client ${socket.id} requested stream restart: ${data?.reason || 'unknown'}`);
+        logger.info({
+            socketId: socket.id,
+            userId: socket.user?.id,
+            reason: data?.reason || 'unknown',
+        }, 'Client requested stream restart')
 
-        // End existing stream
         const recognizeStream = streamingSessions.get(socket.id);
         if (recognizeStream) {
             speechToTextService.endStreamingRecognition(recognizeStream);
@@ -1529,9 +1691,13 @@ io.on('connection', async (socket) => {
                 queueBound = messageQueue.socketToListenerKey.has(socket.id)
             }
             const listenerCount = getTranslationConnectionIds(connection.sessionCode).length
-            console.log(
-                `👂 Listener registered: ${socket.id} → ${data.targetLanguage} (session=${connection.sessionCode}, listeners=${listenerCount})`
-            )
+            logger.info({
+                socketId: socket.id,
+                targetLanguage: data.targetLanguage,
+                sessionCode: connection.sessionCode,
+                listenerCount,
+                queueBound,
+            }, 'Listener registered for translation')
             emitConnectionCount(connection.sessionCode)
             socket.emit('targetLanguageConfirmed', {
                 socketId: socket.id,
@@ -1549,7 +1715,10 @@ io.on('connection', async (socket) => {
             if (messageQueue) {
                 messageQueue.cleanupListener(socket.id)
             }
-            console.log(`👂 Listener unregistered: ${socket.id} (session=${connection.sessionCode})`)
+            logger.info({
+                socketId: socket.id,
+                sessionCode: connection.sessionCode,
+            }, 'Listener unregistered from translation')
             emitConnectionCount(connection.sessionCode)
         }
     })
@@ -1597,15 +1766,20 @@ io.on('connection', async (socket) => {
 
     socket.on('disconnect', async () => {
         const connection = activeConnections.get(socket.id)
-
-        // #region agent log
-        __dbg('server.js:disconnect', 'DISCONNECT', { socketId: socket.id, user: connection?.userEmail || 'listener', isStreaming: !!connection?.isStreaming, hasStream: streamingSessions.has(socket.id), armed: speechToTextService.isRotationArmed(socket.id), restarting: !!restartingStreams.get(socket.id) })
-        // #endregion
         const connectionAgeSeconds = connection?.connectedAt
             ? Math.round((Date.now() - connection.connectedAt) / 1000)
             : null
-        console.log(`🔌 Disconnect: ${socket.id} (user: ${connection?.userEmail || 'listener'}, age: ${connectionAgeSeconds ?? 'unknown'}s)`)
-        console.log(`📊 Total connections before remove: ${activeConnections.size}`)
+
+        logger.info({
+            socketId: socket.id,
+            userId: connection?.userId,
+            userEmail: connection?.userEmail,
+            sessionCode: connection?.sessionCode,
+            connectionAge: connectionAgeSeconds,
+            isStreaming: !!connection?.isStreaming,
+            hasStream: streamingSessions.has(socket.id),
+            connectionsBeforeRemove: activeConnections.size,
+        }, 'Socket disconnected')
 
         // Clean up ping timeout
         if (connection && connection.pingTimeout) {
@@ -1655,28 +1829,32 @@ io.on('connection', async (socket) => {
             }
         }
 
-        // Log connection quality metrics before cleanup
         if (connection) {
             const sessionDuration = Date.now() - connection.lastActivity
             const errorRate = connection.errorCount / Math.max(connection.messageCount, 1)
-            console.log(`📊 Connection metrics for ${socket.user?.email || 'Listener'}:`, {
-                duration: `${Math.round(sessionDuration / 1000)}s`,
-                messages: connection.messageCount,
-                errors: connection.errorCount,
-                errorRate: `${Math.round(errorRate * 100)}%`,
-                quality: connection.connectionQuality
-            })
+            logger.info({
+                socketId: socket.id,
+                userId: connection.userId,
+                userEmail: connection.userEmail,
+                sessionDuration: Math.round(sessionDuration / 1000),
+                messageCount: connection.messageCount,
+                errorCount: connection.errorCount,
+                errorRate: Math.round(errorRate * 100),
+                connectionQuality: connection.connectionQuality,
+            }, 'Connection quality metrics before cleanup')
         }
 
         activeConnections.delete(socket.id)
 
-        console.log(`📊 Total connections after remove: ${activeConnections.size}`)
+        logger.info({
+            socketId: socket.id,
+            totalConnections: activeConnections.size,
+        }, 'Connection removed from active connections')
 
         emitConnectionCount(connection?.sessionCode)
     })
 })
 
-// Periodic cleanup of orphaned connections (every 30 seconds)
 setInterval(() => {
     const orphanedConnections = [];
 
@@ -1688,11 +1866,13 @@ setInterval(() => {
     });
 
     if (orphanedConnections.length > 0) {
-        console.log(`🧹 [Cleanup] Found ${orphanedConnections.length} orphaned connections, cleaning up...`);
+        logger.info({
+            orphanedCount: orphanedConnections.length,
+            orphanedSocketIds: orphanedConnections,
+        }, 'Found orphaned connections, cleaning up')
         orphanedConnections.forEach(socketId => {
             const conn = activeConnections.get(socketId);
-            console.log(`  - Removing orphan: ${socketId} (user: ${conn?.userEmail || 'listener'})`);
-
+            
             if (conn) {
                 handleBackgroundProcessing(socketId, conn);
             }
@@ -1718,9 +1898,11 @@ setInterval(() => {
             activeConnections.delete(socketId);
         });
 
-        // Emit updated connection count
         emitConnectionCount();
-        console.log(`📊 Total connections after cleanup: ${activeConnections.size}`);
+        logger.info({
+            totalConnections: activeConnections.size,
+            cleanedUpCount: orphanedConnections.length,
+        }, 'Orphaned connections cleanup completed')
     }
 }, 30000);
 
@@ -1782,7 +1964,11 @@ async function notifyInterimTranscription(socket, sourceLanguage, interimText) {
                             translatedText: translatedText
                         });
                     } catch (error) {
-                        console.error(`❌ Interim translation error (${sourceLanguage} → ${targetLanguage}):`, error.message);
+                        logger.error({
+                            error: error.message,
+                            sourceLanguage,
+                            targetLanguage,
+                        }, 'Interim translation error')
                         textToSend = interimText;
                     }
                 }
@@ -1851,7 +2037,6 @@ async function processTranscription(transcription, sourceLanguage, targetLanguag
 
 app.get('/health', (req, res) => {
     try {
-        // Simple health check that doesn't depend on external services
         res.status(200).json({
             status: 'OK',
             timestamp: new Date().toISOString(),
@@ -1860,7 +2045,10 @@ app.get('/health', (req, res) => {
             environment: config.NODE_ENV
         })
     } catch (error) {
-        console.error('Health check error:', error);
+        logger.error({
+            error: error.message,
+            stack: error.stack,
+        }, 'Health check endpoint error')
         res.status(500).json({
             status: 'ERROR',
             error: error.message,
@@ -1898,7 +2086,11 @@ app.post('/api/tts', async (req, res) => {
 
         res.send(audioBuffer)
     } catch (error) {
-        console.error('TTS endpoint error:', error)
+        logger.error({
+            error: error.message,
+            stack: error.stack,
+            languageCode: req.body?.languageCode,
+        }, 'TTS endpoint error')
         res.status(500).json({
             error: 'Text-to-speech synthesis failed: ' + error.message
         })
@@ -1932,7 +2124,11 @@ app.get('/api/sessions', authenticateToken, async (req, res) => {
         const sessions = await Session.findByUserId(userId, limit);
         res.json({ sessions });
     } catch (error) {
-        console.error('Error fetching sessions:', error);
+        logger.error({
+            userId: req.user?.id,
+            error: error.message,
+            stack: error.stack,
+        }, 'Error fetching sessions')
         res.status(500).json({ error: 'Failed to fetch sessions' });
     }
 })
@@ -1956,13 +2152,24 @@ app.delete('/api/sessions/:id', authenticateToken, async (req, res) => {
         await Session.delete(id);
         res.json({ success: true, message: 'Session deleted successfully' });
     } catch (error) {
-        console.error('Error deleting session:', error);
+        logger.error({
+            userId: req.user?.id,
+            sessionId: req.params?.id,
+            error: error.message,
+            stack: error.stack,
+        }, 'Error deleting session')
         res.status(500).json({ error: 'Failed to delete session' });
     }
 })
 
 app.use((err, req, res, next) => {
-    console.error(err.stack)
+    logger.error({
+        error: err.message,
+        stack: err.stack,
+        method: req.method,
+        path: req.path,
+        requestId: req.requestId,
+    }, 'Unhandled error in request')
     res.status(500).json({ error: 'Something went wrong!' })
 })
 
@@ -1972,60 +2179,80 @@ app.use((req, res) => {
 
 const startServer = async () => {
     try {
-        console.log('🔧 Starting server initialization...')
-        console.log(`📊 Environment: ${config.NODE_ENV}`)
-        console.log(`🌐 Port: ${config.PORT}`)
-        console.log(`🏠 Host: ${config.HOST}`)
+        logger.info({
+            environment: config.NODE_ENV,
+            port: config.PORT,
+            host: config.HOST,
+        }, 'Starting server initialization')
 
         await new Promise((resolve, reject) => {
             server.listen(config.PORT, config.HOST, () => {
-                console.log(`🚀 Server listening on ${config.HOST}:${config.PORT}`)
+                logger.info({
+                    host: config.HOST,
+                    port: config.PORT,
+                }, 'Server listening')
                 resolve()
             })
             server.on('error', reject)
         })
 
-        console.log('🔧 Starting Firestore initialization...')
         try {
             await initFirestore()
-            console.log('✅ Firestore initialized')
             await AppSettings.ensureDefaults()
+            logger.info('Firestore initialized successfully')
         } catch (dbError) {
-            console.error('❌ Firestore initialization failed:', dbError.message)
-            console.log('⚠️ Server will continue but database features may not work')
+            logger.error({
+                error: dbError.message,
+                stack: dbError.stack,
+            }, 'Firestore initialization failed - server will continue but database features may not work')
         }
 
         try {
             await speechToTextService.warmClient()
-            console.log(`✅ STT client initialized (${speechToTextService.getProviderName()})`)
+            logger.info({
+                provider: speechToTextService.getProviderName(),
+            }, 'STT client initialized')
         } catch (error) {
-            console.warn(`⚠️ STT client initialization failed (${speechToTextService.getProviderName()}):`, error.message)
-            console.log('⚠️ Continuing without streaming STT (transcription will not work)')
+            logger.warn({
+                provider: speechToTextService.getProviderName(),
+                error: error.message,
+            }, 'STT client initialization failed - transcription will not work')
         }
 
         setInterval(() => {
             const now = Date.now()
+            let cleanedCount = 0
             for (const [key, timestamp] of processedTranscripts.entries()) {
                 if (now - timestamp > 10 * 60 * 1000) {
                     processedTranscripts.delete(key)
+                    cleanedCount++
                 }
             }
 
-            // Log connection statistics
-            console.log(`📊 Active connections: ${activeConnections.size}, Processed transcripts: ${processedTranscripts.size}`)
+            logger.info({
+                activeConnections: activeConnections.size,
+                processedTranscripts: processedTranscripts.size,
+                cleanedTranscripts: cleanedCount,
+            }, 'Connection statistics')
         }, 5 * 60 * 1000)
 
-        console.log('✅ Server is ready to accept connections')
+        logger.info('Server is ready to accept connections')
     } catch (error) {
-        console.error('❌ Failed to start server:', error)
+        logger.error({
+            error: error.message,
+            stack: error.stack,
+        }, 'Failed to start server')
         process.exit(1)
     }
 }
 
 const gracefulShutdown = (signal) => {
-    console.log(`🛑 Received ${signal}, shutting down gracefully...`)
+    logger.info({
+        signal,
+        activeConnections: activeConnections.size,
+    }, 'Received shutdown signal, shutting down gracefully')
     server.close(() => {
-        console.log('✅ Server closed')
+        logger.info('Server closed successfully')
         process.exit(0)
     })
 }

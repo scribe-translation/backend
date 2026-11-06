@@ -3,6 +3,18 @@ const path = require('path');
 const fs = require('fs');
 
 let db = null;
+let logger = null;
+
+const getLogger = () => {
+  if (!logger) {
+    try {
+      logger = require('../utils/logger').logger;
+    } catch {
+      logger = console;
+    }
+  }
+  return logger;
+};
 
 /**
  * Initialize and return Firestore client
@@ -18,38 +30,48 @@ const initFirestore = async () => {
     const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || 'scribe-471123';
     const useEmulator = process.env.FIRESTORE_EMULATOR_HOST;
     
+    const log = getLogger();
+    
     if (useEmulator) {
-      // Use Firestore Emulator for local development
-      // Note: Emulator uses (default) database, not named 'default' database
-      console.log(`🔧 Using Firestore Emulator at ${useEmulator}`);
+      log.info({
+        emulatorHost: useEmulator,
+        projectId: 'demo-scribe',
+      }, 'Using Firestore Emulator for local development')
       db = new Firestore({
-        projectId: 'demo-scribe',  // Use demo project for emulator
+        projectId: 'demo-scribe',
       });
     } else {
       const isProduction = process.env.NODE_ENV === 'prod' || process.env.NODE_ENV === 'production';
       const localCredentialsPath = path.join(__dirname, '..', '..', 'google-credentials.json');
-      
-      // Use 'default' named database (not the special "(default)" database)
       const databaseId = 'default';
       
       if (isProduction) {
-        // Production: always use Application Default Credentials (service account)
-        console.log(`🔧 Using Application Default Credentials for Firestore (production, database: ${databaseId})`);
+        log.info({
+          projectId,
+          databaseId,
+          authMethod: 'ApplicationDefaultCredentials',
+        }, 'Using Application Default Credentials for Firestore in production')
         db = new Firestore({
           projectId,
           databaseId,
         });
       } else if (fs.existsSync(localCredentialsPath)) {
-        // Development: use local credentials file if available
-        console.log(`🔧 Using local credentials file for Firestore (development, database: ${databaseId})`);
+        log.info({
+          projectId,
+          databaseId,
+          authMethod: 'LocalCredentialsFile',
+        }, 'Using local credentials file for Firestore in development')
         db = new Firestore({
           projectId,
           keyFilename: localCredentialsPath,
           databaseId,
         });
       } else {
-        // Fallback to ADC
-        console.log(`🔧 Using Application Default Credentials for Firestore (database: ${databaseId})`);
+        log.info({
+          projectId,
+          databaseId,
+          authMethod: 'ApplicationDefaultCredentials',
+        }, 'Using Application Default Credentials for Firestore')
         db = new Firestore({
           projectId,
           databaseId,
@@ -57,13 +79,17 @@ const initFirestore = async () => {
       }
     }
 
-    // Test connection by accessing a collection
     await db.collection('_health').limit(1).get();
-    console.log('✅ Connected to Firestore');
+    log.info('Firestore connection established successfully')
     
     return db;
   } catch (error) {
-    console.error('❌ Firestore initialization failed:', error.message);
+    const log = getLogger();
+    log.error({
+      error: error.message,
+      stack: error.stack,
+      projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+    }, 'Firestore initialization failed')
     throw error;
   }
 };
