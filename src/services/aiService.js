@@ -6,6 +6,18 @@ const config = require('../config');
 
 const GEMINI_MODEL_NAME = 'gemini-2.5-flash-lite';
 
+let logger = null;
+const getLogger = () => {
+  if (!logger) {
+    try {
+      logger = require('../utils/logger').logger;
+    } catch {
+      logger = console;
+    }
+  }
+  return logger;
+};
+
 class AiService {
   constructor() {
     this.model = null;
@@ -22,9 +34,15 @@ class AiService {
         this.isInitialized = true;
         this.backend = 'studio';
         this.provider = 'Google AI Studio (API Key)';
-        console.log(`✅ AI Service initialized via: ${this.provider}`);
+        getLogger().info({
+          provider: this.provider,
+          model: GEMINI_MODEL_NAME,
+        }, 'AI Service initialized')
       } catch (error) {
-        console.error('❌ Failed to initialize Gemini API Key:', error.message);
+        getLogger().error({
+          error: error.message,
+          provider: 'Google AI Studio',
+        }, 'Failed to initialize Gemini API Key')
       }
       return;
     }
@@ -34,9 +52,7 @@ class AiService {
       const location = process.env.GOOGLE_CLOUD_REGION || 'us-central1';
 
       if (!projectId) {
-        console.warn(
-          '⚠️ Both Vertex AI (missing GOOGLE_CLOUD_PROJECT_ID) and GEMINI_API_KEY are missing. AI Summarization disabled.'
-        );
+        getLogger().warn('Both Vertex AI (missing GOOGLE_CLOUD_PROJECT_ID) and GEMINI_API_KEY are missing - AI Summarization disabled')
         return;
       }
 
@@ -53,14 +69,17 @@ class AiService {
       this.provider = googleAuthOptions?.keyFilename
         ? `Google Cloud Vertex AI (credentials file)`
         : `Google Cloud Vertex AI (ADC)`;
-      console.log(
-        `✅ AI Service initialized via: ${this.provider} for project ${projectId}`
-      );
+      getLogger().info({
+        provider: this.provider,
+        projectId,
+        model: GEMINI_MODEL_NAME,
+        location,
+      }, 'AI Service initialized via Vertex AI')
     } catch (error) {
-      console.warn(
-        '⚠️ Failed to initialize Vertex AI. AI Summarization disabled.',
-        error.message
-      );
+      getLogger().warn({
+        error: error.message,
+        provider: 'Vertex AI',
+      }, 'Failed to initialize Vertex AI - AI Summarization disabled')
     }
   }
 
@@ -111,11 +130,12 @@ class AiService {
   async generateSummary(text) {
     if (!this.isInitialized || !text || text.trim().length === 0) {
       if (!this.isInitialized) {
-        console.warn('⚠️ AI Summary skipped: AI service is not initialized');
+        getLogger().debug('AI Summary skipped - AI service is not initialized')
       }
       return null;
     }
 
+    const startTime = Date.now()
     try {
       const prompt = `Please provide a concise, high-level summary of the following session transcription. Keep it to 2-3 paragraphs maximum.
 
@@ -133,13 +153,27 @@ class AiService {
       const summary = this.extractText(result);
 
       if (!summary) {
-        console.warn('⚠️ AI Summary returned empty content');
+        getLogger().warn({
+          textLength: text.length,
+          duration: Date.now() - startTime,
+        }, 'AI Summary returned empty content')
         return null;
       }
 
+      getLogger().info({
+        textLength: text.length,
+        summaryLength: summary.length,
+        duration: Date.now() - startTime,
+      }, 'AI Summary generated successfully')
+
       return summary;
     } catch (error) {
-      console.error('❌ AI Summary generation failed:', error.message);
+      getLogger().error({
+        error: error.message,
+        stack: error.stack,
+        textLength: text.length,
+        duration: Date.now() - startTime,
+      }, 'AI Summary generation failed')
       throw error;
     }
   }

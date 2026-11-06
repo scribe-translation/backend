@@ -1,7 +1,5 @@
-// Load environment variables first
 require('dotenv').config();
 
-// Normalize environment: 'production' -> 'prod'
 let environment = process.env.NODE_ENV || 'dev';
 if (environment === 'production') {
   environment = 'prod';
