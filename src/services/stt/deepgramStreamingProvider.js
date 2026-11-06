@@ -8,6 +8,18 @@ const HEALTH_CHECK_INTERVAL_MS = 10000;
 const DATA_TIMEOUT_MS = 30000;
 const FINALIZE_FLUSH_MS = 300;
 
+let logger = null;
+const getLogger = () => {
+  if (!logger) {
+    try {
+      logger = require('../../utils/logger').logger;
+    } catch {
+      logger = console;
+    }
+  }
+  return logger;
+};
+
 class DeepgramStreamingProvider {
   constructor() {
     this.client = null;
@@ -55,9 +67,13 @@ class DeepgramStreamingProvider {
     const client = this.getClient();
     const deepgramLanguage = mapLanguageCodeForDeepgram(languageCode);
 
-    console.log(
-      `🔍 [Deepgram] Starting live stream for ${languageCode} → ${deepgramLanguage} (nova-3, interim)`
-    );
+    getLogger().info({
+      provider: 'deepgram',
+      languageCode,
+      deepgramLanguage,
+      model: 'nova-3',
+      interimResults: true,
+    }, 'Starting Deepgram live stream');
 
     const connection = await client.listen.v1.connect({
       model: 'nova-3',
@@ -110,9 +126,11 @@ class DeepgramStreamingProvider {
       streamHandle.destroyed = true;
       streamHandle._acceptingResults = false;
       clearTimers();
-      console.log(
-        `📊 [Deepgram] Stream ended after ${(Date.now() - streamHandle._health.createdAt) / 1000}s (${reason})`
-      );
+      getLogger().info({
+        provider: 'deepgram',
+        reason,
+        duration: Math.round((Date.now() - streamHandle._health.createdAt) / 1000),
+      }, 'Deepgram stream ended');
       if (callbacks && callbacks.onEnd) {
         callbacks.onEnd(streamHandle);
       }
@@ -128,13 +146,20 @@ class DeepgramStreamingProvider {
         try {
           streamHandle._connection.close();
         } catch (closeError) {
-          console.warn('⚠️ [Deepgram] Close failed:', closeError.message);
+          getLogger().warn({
+            provider: 'deepgram',
+            error: closeError.message,
+            context: 'forceCloseConnection',
+          }, 'Deepgram close failed');
         }
       }
     };
 
     connection.on('open', () => {
-      console.log(`✅ [Deepgram] Stream open for ${deepgramLanguage}`);
+      getLogger().info({
+        provider: 'deepgram',
+        language: deepgramLanguage,
+      }, 'Deepgram stream opened');
     });
 
     connection.on('message', (data) => {
@@ -154,7 +179,12 @@ class DeepgramStreamingProvider {
       }
 
       if (data?.type === 'Error') {
-        console.error('❌ Deepgram stream error message:', data);
+        getLogger().error({
+          provider: 'deepgram',
+          errorType: data.type,
+          errorCode: data.code,
+          errorMessage: data.description || data.message,
+        }, 'Deepgram stream error message received');
         const error = new Error(data.description || data.message || 'Deepgram stream error');
         error.code = data.code;
         streamHandle._acceptingResults = false;
@@ -169,7 +199,10 @@ class DeepgramStreamingProvider {
     });
 
     connection.on('error', (error) => {
-      console.error('❌ Deepgram streaming error:', error);
+      getLogger().error({
+        provider: 'deepgram',
+        error: error?.message || String(error),
+      }, 'Deepgram streaming error occurred');
       streamHandle._acceptingResults = false;
       clearTimers();
       forceCloseConnection();
@@ -203,7 +236,10 @@ class DeepgramStreamingProvider {
         try {
           streamHandle._connection.sendKeepAlive();
         } catch (error) {
-          console.warn('⚠️ [Deepgram] KeepAlive failed:', error.message);
+          getLogger().warn({
+            provider: 'deepgram',
+            error: error.message,
+          }, 'Deepgram KeepAlive failed');
         }
       }
     }, KEEP_ALIVE_INTERVAL_MS);
@@ -218,9 +254,11 @@ class DeepgramStreamingProvider {
       const streamAge = now - streamHandle._health.createdAt;
 
       if (timeSinceAudio < 5000 && timeSinceData > DATA_TIMEOUT_MS) {
-        console.warn(
-          `⚠️ [Deepgram] Health check failed: No data for ${timeSinceData / 1000}s while audio still flowing. Forcing restart.`
-        );
+        getLogger().warn({
+          provider: 'deepgram',
+          timeSinceData: Math.round(timeSinceData / 1000),
+          timeSinceAudio: Math.round(timeSinceAudio / 1000),
+        }, 'Deepgram health check failed - no data while audio flowing, forcing restart');
         streamHandle._acceptingResults = false;
         clearTimers();
         forceCloseConnection();
@@ -230,9 +268,12 @@ class DeepgramStreamingProvider {
       }
 
       if (streamAge > 0 && streamAge % 60000 < HEALTH_CHECK_INTERVAL_MS) {
-        console.log(
-          `📊 [Deepgram] Health: age=${Math.round(streamAge / 1000)}s, lastData=${Math.round(timeSinceData / 1000)}s ago, lastAudio=${Math.round(timeSinceAudio / 1000)}s ago`
-        );
+        getLogger().debug({
+          provider: 'deepgram',
+          streamAge: Math.round(streamAge / 1000),
+          timeSinceData: Math.round(timeSinceData / 1000),
+          timeSinceAudio: Math.round(timeSinceAudio / 1000),
+        }, 'Deepgram stream health check');
       }
     }, HEALTH_CHECK_INTERVAL_MS);
 
@@ -251,7 +292,10 @@ class DeepgramStreamingProvider {
       streamHandle._health.lastAudioTime = Date.now();
       streamHandle._connection.sendMedia(audioBuffer);
     } catch (error) {
-      console.error('❌ Error writing audio to Deepgram stream:', error);
+      getLogger().error({
+        provider: 'deepgram',
+        error: error.message,
+      }, 'Error writing audio to Deepgram stream');
     }
   }
 
@@ -283,7 +327,10 @@ class DeepgramStreamingProvider {
     try {
       connection.sendFinalize();
     } catch (error) {
-      console.warn('⚠️ [Deepgram] Finalize failed:', error.message);
+      getLogger().warn({
+        provider: 'deepgram',
+        error: error.message,
+      }, 'Deepgram finalize failed');
     }
 
     streamHandle._finalizeTimer = setTimeout(() => {
@@ -296,7 +343,10 @@ class DeepgramStreamingProvider {
         try {
           connection.close();
         } catch (closeError) {
-          console.warn('⚠️ [Deepgram] Close failed:', closeError.message);
+          getLogger().warn({
+            provider: 'deepgram',
+            error: closeError.message,
+          }, 'Deepgram close failed during finalize');
         }
       }
     }, FINALIZE_FLUSH_MS);
